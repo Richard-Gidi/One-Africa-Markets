@@ -1,0 +1,7 @@
+streamlit==1.39.0
+pandas
+numpy
+feedparser
+beautifulsoup4
+scikit-learn
+requests
