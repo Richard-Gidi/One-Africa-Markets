@@ -3,15 +3,12 @@
 # Focus: Robust news-only pipeline (RSS/Atom + optional Newsdata.io) with premium UI and friendly error handling.
 # Run: streamlit run streamlit_app.py
 
-import re
 import os
+import re
 import html
-import json
-import time
 import hashlib
 import datetime as dt
 from typing import List, Dict, Tuple, Optional, Any
-from functools import lru_cache
 from urllib.parse import urlparse, urljoin
 
 import numpy as np
@@ -197,6 +194,17 @@ CARD_CSS = """
 .link { text-decoration: none; font-weight:700; color:#2563eb; }
 </style>
 """
+
+# ========================= Secrets helper (hide your API key) =========================
+def get_newsdata_api_key() -> str:
+    """Prefer Streamlit secrets, then environment variable. Never shows the key."""
+    try:
+        key = st.secrets.get("NEWSDATA_API_KEY", "")
+    except Exception:
+        key = ""
+    if not key:
+        key = os.environ.get("NEWSDATA_API_KEY", "")
+    return key or ""
 
 # ========================= HTTP utils + safe wrappers =========================
 def get_session() -> requests.Session:
@@ -494,15 +502,33 @@ def fetch_from_feed(url: str, start_date: dt.datetime, end_date: dt.datetime,
         })
     return items
 
-# ========================= Newsdata.io =========================
+# ========================= Newsdata.io — secret-safe two-step =========================
 NEWSDATA_BASE = "https://newsdata.io/api/1/latest"
 
 @st.cache_data(ttl=60*10, show_spinner=False)
-def fetch_from_newsdata_cached(params: Dict[str, Any], max_pages: int) -> List[Dict[str, Any]]:
+def fetch_from_newsdata_cached(redacted_params: Dict[str, Any], max_pages: int) -> List[Dict[str, Any]]:
+    """
+    Cached by *redacted* params only (no API key inside cache).
+    We do not perform network calls here to avoid storing secrets in cache.
+    """
+    return []  # stub — actual fetch happens in runtime wrapper
+
+def fetch_from_newsdata_runtime(
+    api_key: str,
+    base_params: Dict[str, Any],
+    max_pages: int
+) -> List[Dict[str, Any]]:
+    """
+    Real network calls happen here with the API key in-memory only.
+    """
     session = get_session()
     items: List[Dict[str, Any]] = []
     pages = 0
     next_page = None
+
+    params = dict(base_params)
+    params["apikey"] = api_key
+
     while pages < max_pages:
         try:
             q = dict(params)
@@ -523,6 +549,7 @@ def fetch_from_newsdata_cached(params: Dict[str, Any], max_pages: int) -> List[D
         except Exception as e:
             soft_fail("Temporarily skipped an API page due to connectivity.", f"newsdata EXC {e}")
             break
+
     return items
 
 def fetch_from_newsdata(
@@ -537,12 +564,19 @@ def fetch_from_newsdata(
 ) -> List[Dict[str, Any]]:
     if not api_key:
         return []
-    params = {"apikey": api_key, "q": query or ""}
-    if language: params["language"] = language
-    if country: params["country"] = country
-    if category: params["category"] = category
 
-    items_raw = fetch_from_newsdata_cached(params, max_pages=max_pages)
+    # REDACTED params for cache identity (no key)
+    redacted = {"q": query or ""}
+    if language: redacted["language"] = language
+    if country: redacted["country"] = country
+    if category: redacted["category"] = category
+
+    # Call stub cache (keeps cache flow consistent without storing secrets)
+    _ = fetch_from_newsdata_cached(redacted, max_pages=max_pages)
+
+    # Then do the real fetch runtime with the key
+    items_raw = fetch_from_newsdata_runtime(api_key=api_key, base_params=redacted, max_pages=max_pages)
+
     items: List[Dict[str, Any]] = []
     for a in items_raw:
         try:
@@ -605,67 +639,103 @@ with st.container():
     </div>
     """, unsafe_allow_html=True)
 
+# ========================= SINGLE COLLAPSIBLE CONFIG PANEL =========================
 with st.sidebar:
-    st.header("⚙️ Configuration")
+    with st.expander("⚙️ Configurations", expanded=False):
+        st.header("Settings")
 
-    with st.expander("📰 RSS/Atom Sources", expanded=True):
+        # 📰 RSS/Atom Sources
+        st.subheader("📰 RSS/Atom Sources")
         chosen_sources: List[str] = []
         for name, url in DEFAULT_SOURCES.items():
-            if st.checkbox(name, value=True):
+            if st.checkbox(name, value=True, key=f"src_{name}"):
                 chosen_sources.append(url)
-        if st.button("🔄 Check Feeds"):
+        if st.button("🔄 Check Feeds", key="check_feeds"):
             for name, url in DEFAULT_SOURCES.items():
                 ok, status = validate_feed(url, ignore_recency_check=True)
                 st.write(f"{'✅' if ok else '❌'} {name}: {status}")
 
-    with st.expander("🧩 Newsdata.io (optional)", expanded=False):
-        st.caption("Merge API headlines with the same scoring & summaries.")
-        use_newsdata = st.checkbox("Use Newsdata.io", value=True)
-        newsdata_key = st.text_input("API Key", value="pub_72ee7f1de10849be8847f7ad4e1b8810", type="password")
-        newsdata_query = st.text_input("Query", value="tree crop commodities")
-        c1, c2, c3 = st.columns(3)
-        with c1: nd_language = st.text_input("Language (e.g., en, fr)", value="")
-        with c2: nd_country = st.text_input("Country (e.g., gh, ng, ci)", value="")
-        with c3: nd_category = st.text_input("Category (e.g., business)", value="")
-        nd_pages = st.slider("Newsdata pages", 1, 5, 2)
+        st.markdown("---")
 
-    with st.expander("📅 Date Range", expanded=True):
-        mode = st.radio("Mode", ["Quick Select", "Custom"], horizontal=True)
+        # 🧩 Newsdata.io (optional) — secure key handling
+        st.subheader("🧩 Newsdata.io (optional)")
+        st.caption("Merge API headlines with the same scoring & summaries.")
+        use_newsdata = st.checkbox("Use Newsdata.io", value=True, key="use_nd")
+
+        # Auto-load from secrets or env (hidden)
+        auto_key = get_newsdata_api_key()
+
+        # Optional temporary override (not saved, masked)
+        override = st.checkbox("Temporarily override API key (not saved)", value=False, key="nd_override")
+        tmp_key = ""
+        if override:
+            tmp_key = st.text_input("Enter API key", type="password", key="nd_key_input")
+
+        # Decide which key to use at runtime (override > secrets/env)
+        newsdata_key = (tmp_key or auto_key).strip()
+
+        # Subtle status line (no key shown)
+        if use_newsdata:
+            if newsdata_key:
+                st.success("Using secured API key.")
+            else:
+                st.warning("No API key found. Add NEWSDATA_API_KEY to Streamlit secrets or environment, or use a temporary override.")
+
+        newsdata_query = st.text_input("Query", value="tree crop commodities", key="nd_query")
+        c1, c2, c3 = st.columns(3)
+        with c1: nd_language = st.text_input("Language (e.g., en, fr)", value="", key="nd_lang")
+        with c2: nd_country = st.text_input("Country (e.g., gh, ng, ci)", value="", key="nd_cty")
+        with c3: nd_category = st.text_input("Category (e.g., business)", value="", key="nd_cat")
+        nd_pages = st.number_input("Newsdata pages", min_value=1, max_value=10, value=2, step=1, key="nd_pages")
+
+        st.markdown("---")
+
+        # 📅 Date Range
+        st.subheader("📅 Date Range")
+        mode = st.radio("Mode", ["Quick Select", "Custom"], horizontal=True, key="date_mode")
         if mode == "Quick Select":
             quick = {"Last 24 Hours": 1, "Last 3 Days": 3, "Last Week": 7, "Last 2 Weeks": 14, "Last Month": 30}
-            sel = st.selectbox("Window", list(quick.keys()), index=2)
+            sel = st.selectbox("Window", list(quick.keys()), index=2, key="date_win")
             end_date = dt.datetime.now(dt.timezone.utc)
             start_date = end_date - dt.timedelta(days=quick[sel])
         else:
-            c1, c2 = st.columns(2)
-            with c1: sd = st.date_input("Start", value=dt.date.today() - dt.timedelta(days=7))
-            with c2: ed = st.date_input("End", value=dt.date.today())
+            d1, d2 = st.columns(2)
+            with d1: sd = st.date_input("Start", value=dt.date.today() - dt.timedelta(days=7), key="start_date")
+            with d2: ed = st.date_input("End", value=dt.date.today(), key="end_date")
             start_date = dt.datetime.combine(sd, dt.time.min, tzinfo=dt.timezone.utc)
             end_date = dt.datetime.combine(ed, dt.time.max, tzinfo=dt.timezone.utc)
 
-    with st.expander("🔍 Keywords & Filters", expanded=True):
-        custom_kw = st.text_area("Keywords (comma-separated)", ", ".join(DEFAULT_KEYWORDS), height=100)
+        st.markdown("---")
+
+        # 🔍 Keywords & Filters
+        st.subheader("🔍 Keywords & Filters")
+        custom_kw = st.text_area("Keywords (comma-separated)", ", ".join(DEFAULT_KEYWORDS), height=100, key="kw_text")
         keywords = [k.strip() for k in custom_kw.split(",") if k.strip()]
-        min_relevance = st.slider("Min relevance", 0.0, 1.0, 0.05, 0.01)
-        per_source_cap = st.slider("Max articles per source", 5, 50, 20)
+        min_relevance = st.number_input("Min relevance (0.00–1.00)", min_value=0.0, max_value=1.0, value=0.05, step=0.01, format="%.2f", key="min_rel")
+        per_source_cap = st.number_input("Max articles per source", min_value=1, max_value=200, value=20, step=1, key="cap")
 
-    with st.expander("📝 Content Settings", expanded=True):
-        n_sent = st.slider("Sentences per summary", 2, 6, 3)
-        top_k = st.slider("Digest: top items", 5, 30, 12)
+        st.markdown("---")
 
-    st.markdown("---")
-    st.subheader("🛡️ Resilience")
-    force_fetch = st.checkbox("⚡ Force RSS fetch if validation fails", value=True)
-    ignore_recency = st.checkbox("🕒 Ignore RSS recency check", value=True)
-    dedupe_across_sources = st.checkbox("🧹 Deduplicate across sources", value=True)
+        # 📝 Content Settings
+        st.subheader("📝 Content Settings")
+        n_sent = st.number_input("Sentences per summary", min_value=2, max_value=10, value=3, step=1, key="n_sent")
+        top_k = st.number_input("Digest: top items", min_value=5, max_value=100, value=12, step=1, key="top_k")
 
-    st.markdown("---")
-    colA, colB = st.columns(2)
-    with colA:
-        run_btn = st.button("🚀 Scan Now", use_container_width=True)
-    with colB:
-        if st.button("♻️ Reset", use_container_width=True):
-            st.rerun()
+        st.markdown("---")
+
+        # 🛡️ Resilience
+        st.subheader("🛡️ Resilience")
+        force_fetch = st.checkbox("⚡ Force RSS fetch if validation fails", value=True, key="force")
+        ignore_recency = st.checkbox("🕒 Ignore RSS recency check", value=True, key="ignore_recent")
+        dedupe_across_sources = st.checkbox("🧹 Deduplicate across sources", value=True, key="dedupe")
+
+        st.markdown("---")
+        colA, colB = st.columns(2)
+        with colA:
+            run_btn = st.button("🚀 Scan Now", use_container_width=True, key="run")
+        with colB:
+            if st.button("♻️ Reset", use_container_width=True, key="reset"):
+                st.rerun()
 
 # ========================= Processing =========================
 def hash_key(*parts) -> str:
@@ -755,7 +825,7 @@ def fetch_all(chosen_sources: List[str]) -> List[Dict[str, Any]]:
                 language=nd_language or None,
                 country=nd_country or None,
                 category=nd_category or None,
-                max_pages=nd_pages,
+                max_pages=int(nd_pages),
             )
             if per_source_cap and nd_items:
                 nd_items = nd_items[:per_source_cap]
@@ -844,7 +914,6 @@ def friendly_error_summary():
     """Show a compact, friendly banner summarizing soft issues (no stack traces)."""
     if not SOFT_ERRORS:
         return
-    # Count distinct messages and occurrences
     counts: Dict[str,int] = {}
     for m in SOFT_ERRORS:
         counts[m] = counts.get(m, 0) + 1
@@ -858,6 +927,9 @@ This doesn’t affect your ability to scan and summarize current items.
 
 # ========================= Main =========================
 st.markdown(CARD_CSS, unsafe_allow_html=True)
+
+if 'run_btn' not in locals():
+    run_btn = False  # safety if sidebar didn't render for some reason
 
 if not run_btn:
     st.info("""
@@ -879,9 +951,7 @@ else:
                 df = process_rows(rows)
                 ui_results(df, top_k)
     except Exception as e:
-        # Final safety net—never leak stack traces to UI
         soft_fail("Something went wrong while assembling the results.", f"MAIN EXC {e}")
         st.error("We ran into a hiccup assembling the results. Please try again or adjust your filters.")
     finally:
-        # Show friendly banner summarizing non-critical issues encountered
         friendly_error_summary()
