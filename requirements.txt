@@ -5,3 +5,5 @@ feedparser
 beautifulsoup4
 scikit-learn
 requests
+python-dotenv
+openai==1.*

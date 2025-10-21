@@ -22,6 +22,17 @@ from requests.packages.urllib3.util.retry import Retry
 import xml.etree.ElementTree as ET
 import logging
 
+# ==== NEW: env loader ====
+from dotenv import load_dotenv
+load_dotenv()  # reads .env into process env
+
+# ==== NEW: OpenAI client (safe import) ====
+OPENAI_OK = True
+try:
+    from openai import OpenAI
+except Exception:
+    OPENAI_OK = False
+
 # ========================= Streamlit safety: hide tracebacks =========================
 st.set_option('client.showErrorDetails', False)
 
@@ -172,7 +183,7 @@ CARD_CSS = """
 /* Article cards */
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 16px; }
 .card {
-  background: #ffffff; /* force white so text colors below always contrast */
+  background: #ffffff;
   border: 1px solid rgba(0,0,0,.06);
   border-radius: 14px; overflow: hidden;
   transition: transform .15s ease, box-shadow .15s ease;
@@ -180,22 +191,11 @@ CARD_CSS = """
 .card:hover { transform: translateY(-3px); box-shadow: 0 10px 24px rgba(0,0,0,0.08); }
 .thumb { width: 100%; height: 180px; object-fit: cover; background:#f6f7f9; }
 .card-body { padding: 14px; }
-
-/* FORCE readable colors regardless of Streamlit theme */
-.card .title {
-  color: #111827 !important;
-  font-weight: 800;
-  font-size: 18px;
-  margin: 6px 0 8px 0;
-  line-height: 1.25;
-}
+.card .title { color: #111827 !important; font-weight: 800; font-size: 18px; margin: 6px 0 8px 0; line-height: 1.25; }
 .card .meta { color: #6b7280 !important; font-size: 12px; display:flex; gap:10px; flex-wrap:wrap; margin-bottom:8px; }
 .card .summary { color:#374151 !important; font-size: 13px; line-height:1.55; margin-top: 6px; }
 .badges { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0; }
-.badge {
-  font-size: 11px; font-weight:700; padding:4px 8px; border-radius:999px;
-  background:#eef2ff; color:#3730a3; border:1px solid #c7d2fe;
-}
+.badge { font-size: 11px; font-weight:700; padding:4px 8px; border-radius:999px; background:#eef2ff; color:#3730a3; border:1px solid #c7d2fe; }
 .link { text-decoration: none; font-weight:700; color:#2563eb !important; }
 </style>
 """
@@ -209,6 +209,16 @@ def get_newsdata_api_key() -> str:
         key = ""
     if not key:
         key = os.environ.get("NEWSDATA_API_KEY", "")
+    return key or ""
+
+def get_openai_api_key() -> str:
+    """Reads OPENAI_API_KEY only from env/secrets. Never displays it."""
+    try:
+        key = st.secrets.get("OPENAI_API_KEY", "")
+    except Exception:
+        key = ""
+    if not key:
+        key = os.environ.get("OPENAI_API_KEY", "")
     return key or ""
 
 # ========================= HTTP utils + safe wrappers =========================
@@ -633,14 +643,8 @@ with st.container():
     </div>
     """, unsafe_allow_html=True)
 
-# ======= ACTION BAR (OUTSIDE CONFIGURATIONS) =======
+# ======= ACTION BAR =======
 st.markdown("<br>", unsafe_allow_html=True)
-act_c1, act_c2 = st.columns([3, 1])
-with act_c1:
-    st.markdown("### Actions")
-with act_c2:
-    pass
-
 act_b1, act_b2 = st.columns([1, 1])
 with act_b1:
     run_btn = st.button("🚀 Scan Now", use_container_width=True, key="run_main")
@@ -649,7 +653,69 @@ with act_b2:
         st.session_state.clear()
         st.rerun()
 
-# ========================= SINGLE COLLAPSIBLE CONFIG PANEL (no buttons here) =========================
+# ======= CHAT ASSISTANT (always visible) =======
+st.markdown("### 🤖 Chat Assistant")
+st.caption("Ask follow-ups, draft digests, or generate summaries. Uses your `.env` OPENAI_API_KEY if available.")
+
+def init_chat_state():
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = [
+            {"role": "system", "content": (
+                "You are a crisp market-intelligence assistant for West African tree crops (cashew, shea, cocoa, palm kernel). "
+                "Be concise, cite assumptions, and suggest actionable next steps. If asked to summarize a table, write bullet points."
+            )}
+        ]
+
+init_chat_state()
+
+# display history (omit system)
+for m in st.session_state.chat_history:
+    if m["role"] == "system":
+        continue
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+
+user_prompt = st.chat_input("Type your message...")
+if user_prompt:
+    # append user
+    st.session_state.chat_history.append({"role": "user", "content": user_prompt})
+    with st.chat_message("user"):
+        st.markdown(user_prompt)
+
+    # respond
+    api_key = get_openai_api_key()
+    if not OPENAI_OK:
+        with st.chat_message("assistant"):
+            st.warning("OpenAI SDK isn’t installed. Run `pip install openai==1.*`.")
+    elif not api_key:
+        with st.chat_message("assistant"):
+            st.warning("No `OPENAI_API_KEY` found in `.env` or Streamlit secrets. Please add it and rerun.")
+    else:
+        try:
+            client = OpenAI(api_key=api_key)
+            # Stream the response
+            with st.chat_message("assistant"):
+                placeholder = st.empty()
+                collected = ""
+                # Use a cost-efficient default; you can change to gpt-4o if you prefer.
+                stream = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=st.session_state.chat_history,
+                    stream=True,
+                    temperature=0.4,
+                )
+                for chunk in stream:
+                    delta = chunk.choices[0].delta.content or ""
+                    collected += delta
+                    placeholder.markdown(collected)
+                st.session_state.chat_history.append({"role": "assistant", "content": collected})
+        except Exception as e:
+            # Don’t leak error details to users
+            logger.warning(f"OpenAI chat error: {e}")
+            with st.chat_message("assistant"):
+                st.error("The assistant hit a temporary snag. Please try again.")
+
+# ========================= SINGLE COLLAPSIBLE CONFIG PANEL =========================
 with st.sidebar:
     with st.expander("⚙️ Configurations", expanded=False):
         st.header("Settings")
@@ -667,27 +733,21 @@ with st.sidebar:
 
         st.markdown("---")
 
-        # 🧩 Newsdata.io (optional) — secure key handling
+        # 🧩 Newsdata.io (optional)
         st.subheader("🧩 Newsdata.io (optional)")
         st.caption("Merge API headlines with the same scoring & summaries.")
         use_newsdata = st.checkbox("Use Newsdata.io", value=True, key="use_nd")
 
-        # Auto-load from secrets or env (hidden)
         auto_key = get_newsdata_api_key()
-
-        # Optional temporary override (not saved, masked)
         override = st.checkbox("Temporarily override API key (not saved)", value=False, key="nd_override")
-        tmp_key = ""
-        if override:
-            tmp_key = st.text_input("Enter API key", type="password", key="nd_key_input")
-
+        tmp_key = st.text_input("Enter API key", type="password", key="nd_key_input") if override else ""
         newsdata_key = (tmp_key or auto_key).strip()
 
         if use_newsdata:
             if newsdata_key:
                 st.success("Using secured API key.")
             else:
-                st.warning("No API key found. Add NEWSDATA_API_KEY to Streamlit secrets or environment, or use a temporary override.")
+                st.warning("No API key found. Add NEWSDATA_API_KEY to `.env` or Streamlit secrets, or use a temporary override.")
 
         newsdata_query = st.text_input("Query", value="tree crop commodities", key="nd_query")
         c1, c2, c3 = st.columns(3)
@@ -744,7 +804,6 @@ def hash_key(*parts) -> str:
 def process_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(columns=["source","published","title","relevance","impact","auto_summary","link","image"])
-    # Deduplicate by (title, link)
     seen = set()
     cleaned = []
     for r in rows:
@@ -943,11 +1002,11 @@ if not run_btn:
     """)
 else:
     try:
-        if not 'chosen_sources' in locals():
+        if 'chosen_sources' not in locals():
             chosen_sources = []
-        if not 'use_newsdata' in locals():
+        if 'use_newsdata' not in locals():
             use_newsdata = False
-        if not 'newsdata_key' in locals():
+        if 'newsdata_key' not in locals():
             newsdata_key = ""
         if not chosen_sources and not (use_newsdata and newsdata_key):
             st.error("Pick at least one RSS source or enable Newsdata.io (see Configurations).")
