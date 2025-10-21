@@ -211,7 +211,6 @@ def _get_secret_safely(name: str) -> str:
     if val:
         return str(val).strip().strip('"').strip("'")
     try:
-        # If secrets exist, this will be a non-empty mapping
         if hasattr(st, "secrets"):
             try:
                 if len(st.secrets) > 0 and name in st.secrets:
@@ -672,8 +671,9 @@ def have_openai():
 
 def get_openai_client():
     try:
-        return OpenAI(api_key=get_openai_api_key(),base_url="https://models.github.ai/inference")
-
+        # If you use the standard OpenAI endpoint, remove base_url arg.
+        # This base_url was in your last version; keeping as-is.
+        return OpenAI(api_key=get_openai_api_key(), base_url="https://models.github.ai/inference")
     except Exception as e:
         logger.warning(f"OpenAI client init failed: {e}")
         return None
@@ -732,6 +732,7 @@ def generate_assistant_reply(messages, temperature: float = 0.4):
             )
             reply = (comp.choices[0].message.content or "").strip()
             if reply:
+                # NOTE: We don't render here to avoid double-rendering.
                 return reply, False
         except Exception as e2:
             logger.warning(f"OpenAI non-streaming failed on {model}: {e2}")
@@ -741,7 +742,7 @@ def generate_assistant_reply(messages, temperature: float = 0.4):
     soft_fail("Assistant is temporarily unavailable.", f"OpenAI failures: {last_err}")
     return None, False
 
-# Render history (omit system)
+# Render prior chat (omit system)
 for m in st.session_state.chat_history:
     if m["role"] == "system":
         continue
@@ -761,6 +762,10 @@ if user_prompt:
     else:
         reply, _streamed = generate_assistant_reply(st.session_state.chat_history)
         if reply:
+            # >>> FIX: if not streamed, render immediately so user sees it now
+            if not _streamed:
+                with st.chat_message("assistant"):
+                    st.markdown(reply)
             st.session_state.chat_history.append({"role": "assistant", "content": reply})
         else:
             with st.chat_message("assistant"):
