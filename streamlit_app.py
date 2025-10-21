@@ -672,7 +672,8 @@ def have_openai():
 
 def get_openai_client():
     try:
-        return OpenAI(api_key=get_openai_api_key())
+        return OpenAI(api_key=get_openai_api_key(),base_url="https://models.github.ai/inference")
+
     except Exception as e:
         logger.warning(f"OpenAI client init failed: {e}")
         return None
