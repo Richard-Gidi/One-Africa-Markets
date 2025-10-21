@@ -1,12 +1,7 @@
-# OneAfrica Market Pulse — Automated Market Intelligence (Streamlit Demo)
-# Author: Richard Gidi
+# Africa Commodity Pulse — Cashew • Shea • Cocoa • Gold • Oil
 # Run: streamlit run streamlit_app.py
 
-import os
-import re
-import html
-import hashlib
-import datetime as dt
+import os, re, html, hashlib, datetime as dt
 from typing import List, Dict, Tuple, Optional, Any
 from urllib.parse import urlparse, urljoin
 
@@ -22,596 +17,609 @@ from requests.packages.urllib3.util.retry import Retry
 import xml.etree.ElementTree as ET
 import logging
 
-# ==== resilient .env loader ====
+# ---------- .env (optional) ----------
 try:
-    from dotenv import load_dotenv  # pip install python-dotenv
+    from dotenv import load_dotenv
     load_dotenv()
 except Exception:
     pass
 
-# ==== OpenAI (lazy + resilient import) ====
-OPENAI_OK = True
-try:
-    from openai import OpenAI  # pip install openai==1.*
-except Exception:
-    OPENAI_OK = False
-
-# ========================= Streamlit safety: hide tracebacks =========================
-st.set_option('client.showErrorDetails', False)
-
-# ========================= Logging (server console only) =========================
-logger = logging.getLogger("oneafrica.pulse")
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-logger.setLevel(logging.INFO)
-
-# ========================= Optional sklearn (graceful fallback) =========================
+# ---------- Optional sklearn ----------
 HAS_SK = True
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
 except Exception:
     HAS_SK = False
-    logger.info("sklearn not available; falling back to keyword hit scoring.")
 
-# ========================= App Strings / Theme =========================
-APP_NAME = "One Africa Market Pulse"
-TAGLINE = "Automated intelligence for cashew, shea, cocoa & allied markets."
+# ---------- Streamlit safety ----------
+st.set_option("client.showErrorDetails", False)
+
+# ---------- Logging (server console only) ----------
+logger = logging.getLogger("africa.pulse")
+if not logger.handlers:
+    h = logging.StreamHandler()
+    h.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(h)
+logger.setLevel(logging.INFO)
+
+# ---------- App strings ----------
+APP_NAME = "Africa Commodity Pulse"
+TAGLINE = "Africa-focused market intelligence for cashew, shea, cocoa, gold & oil."
 QUOTE = "“Ask your data why, until it has nothing else to say.” — Richard Gidi"
-
-# Fallback image for articles with no thumbnail
 FALLBACK_IMG = "https://images.unsplash.com/photo-1519681393784-d120267933ba?q=80&w=1200&auto=format&fit=crop"
 
-DEFAULT_KEYWORDS = [
-    "cashew", "shea", "shea nut", "cocoa", "palm kernel", "agri", "export", "harvest",
-    "shipment", "freight", "logistics", "port", "tariff", "ban", "fx", "currency",
-    "cedi", "naira", "inflation", "subsidy", "cooperative", "value-addition", "processing",
-    "ghana", "nigeria", "cote d’ivoire", "ivory coast", "benin", "togo", "burkina",
-    "west africa", "sahel", "trade policy", "commodity", "price", "market"
+# ---------- Hard interest filters ----------
+TARGET_TERMS = [
+    "cashew", "shea", "cocoa", "gold", "oil", "crude", "brent", "wti",
+    "palm", "palm oil"  # (keep palm if you want broader edible oils)
 ]
+# Africa region signals (countries + 'Africa')
+AF_COUNTRIES = [
+    "ghana","nigeria","côte d’ivoire","cote d’ivoire","ivory coast","benin","togo",
+    "burkina","burkina faso","senegal","gambia","sierra leone","liberia","guinea",
+    "mali","niger","cameroon","tanzania","kenya","uganda","rwanda","burundi",
+    "ethiopia","sudan","south sudan","angola","mozambique","zambia","zimbabwe",
+    "namibia","botswana","south africa","lesotho","eswatini","swaziland","somalia",
+    "eritrea","djibouti","comoros","seychelles","mauritius","madagascar","algeria",
+    "tunisia","morocco","libya","egypt","mauritania","cape verde","cabo verde","africa"
+]
+AFRICAN_HINTS = set(AF_COUNTRIES)
 
-# Curated working RSS/Atom sources
+# ---------- Default keywords for scoring (soft boost) ----------
+DEFAULT_KEYWORDS = list(dict.fromkeys(TARGET_TERMS + [
+    "export","import","tariff","shipment","freight","port","logistics",
+    "price","premium","discount","supply","demand","harvest","processing",
+    "cooperative","traceability","fx","currency","naira","cedi","rand",
+    "policy","subsidy","ban","embargo","strike","congestion"
+]))
+
+# ---------- Feeds (Africa + commodity heavy) ----------
+# Keep to feeds that typically work without paywalls/403.
 DEFAULT_SOURCES = {
-    "AllAfrica » Agriculture": "https://allafrica.com/tools/headlines/rdf/agriculture/headlines.rdf",
-    "AllAfrica » Business": "https://allafrica.com/tools/headlines/rdf/business/headlines.rdf",
-    "The Standard » Business": "https://www.standardmedia.co.ke/rss/business.php",
-    "The Standard » Agriculture": "https://www.standardmedia.co.ke/rss/agriculture.php",
-    "CitiNewsroom": "https://citinewsroom.com/feed/",
-    "FAO News (All topics)": "https://www.fao.org/news/rss/en",
-    "FAO GIEWS": "https://www.fao.org/giews/rss/en/",
-    "FreshPlaza Africa": "https://www.freshplaza.com/africa/rss.xml",
-    "African Arguments": "https://africanarguments.org/feed/",
-    "How We Made It In Africa": "https://www.howwemadeitinafrica.com/feed/",
-    "Bizcommunity (Africa • Agri+Logistics)": "https://www.bizcommunity.com/GenerateRss.aspx?i=63,76&c=81",
+    # Pan-Africa & regional business/agri
+    "AllAfrica • Agriculture": "https://allafrica.com/tools/headlines/rdf/agriculture/headlines.rdf",
+    "AllAfrica • Business":    "https://allafrica.com/tools/headlines/rdf/business/headlines.rdf",
+    "FreshPlaza Africa":       "https://www.freshplaza.com/africa/rss.xml",
+    "CitiNewsroom (Ghana)":    "https://citinewsroom.com/feed/",
+    "Ghana Business News":     "https://www.ghanabusinessnews.com/feed/",
+    "Business Day (Nigeria)":  "https://businessday.ng/feed/",
+    "Daily Monitor (Uganda)":  "https://www.monitor.co.ug/rss.xml",
+    "The EastAfrican":         "https://www.theeastafrican.co.ke/tea/rss.xml",
+    "How We Made It In Africa":"https://www.howwemadeitinafrica.com/feed/",
+    "Bizcommunity (Africa Agri)":"https://www.bizcommunity.com/GenerateRss.aspx?i=63&c=81",
+
+    # Cocoa & West Africa supply chain often covered here:
+    "Reuters Commodities":     "https://feeds.reuters.com/news/commodities",
+    "FAO News":                "https://www.fao.org/news/rss/en",
+    "WTO News":                "https://www.wto.org/english/news_e/news_e.rss",
+
+    # Energy / Oil (Africa & global context)
+    "Maritime Executive":      "https://www.maritime-executive.com/rss",
+    "gCaptain":                "https://gcaptain.com/feed/",
+    "The Loadstar":            "https://theloadstar.com/feed/",
 }
 
-IMPACT_RULES = {
-    "Supply Risk": [
-        r"\bexport (?:ban|restriction|control)\b",
-        r"\b(?:import|trade) (?:ban|restriction|control)\b",
-        r"\bembargo\b",
-        r"\b(?:drought|flood|rainfall|weather)\b",
-        r"\b(?:pest|disease|infestation)\b",
-        r"\b(?:shortage|scarcity)\b",
-        r"\b(?:strike|protest|unrest)\b",
-        r"\bport (?:closure|congestion|delay)\b",
-        r"\bharvest (?:delay|loss|damage)\b",
-        r"\bproduction (?:issue|problem|concern)\b",
-    ],
-    "Price Upside": [
-        r"\bstrong (?:demand|buying|interest)\b",
-        r"\b(?:surge|spike|jump|rise|increase)\b",
-        r"\b(?:grant|stimulus|support)\b",
-        r"\b(?:incentive|subsidy|funding)\b",
-        r"\bvalue[- ](?:addition|chain|processing)\b",
-        r"\bhigh(?:er)? (?:price|demand|consumption)\b",
-        r"\bmarket (?:rally|strength|upturn)\b",
-        r"\bsupply (?:squeeze|shortage|tightness)\b",
-        r"\bquality premium\b",
-    ],
-    "Price Downside": [
-        r"\b(?:oversupply|surplus|glut)\b",
-        r"\b(?:decline|fall|drop|decrease|slump)\b",
-        r"\b(?:weak|soft|bearish) (?:price|market|demand)\b",
-        r"\bcut (?:price|rate|cost)\b",
-        r"\blow(?:er)? (?:price|demand|consumption)\b",
-        r"\bmarket (?:weakness|downturn)\b",
-        r"\bcompetitive pressure\b",
-    ],
-    "FX & Policy": [
-        r"\b(?:depreciation|devaluation)\b",
-        r"\bweak(?:ening)? (?:currency|exchange)\b",
-        r"\b(?:fx|forex|dollar|euro|yuan)\b",
-        r"\b(?:monetary|fiscal|trade) policy\b",
-        r"\b(?:interest|exchange) rate\b",
-        r"\b(?:tariff|duty|levy|tax)\b",
-        r"\bregulatory (?:change|update|requirement)\b",
-        r"\bpolicy (?:change|update|reform)\b",
-    ],
-    "Logistics & Trade": [
-        r"\b(?:freight|shipping|transport)\b",
-        r"\b(?:port|container|vessel|cargo)\b",
-        r"\b(?:congestion|delay|bottleneck)\b",
-        r"\b(?:reroute|divert|alternative route)\b",
-        r"\b(?:cost|rate) (?:increase|surge|rise)\b",
-        r"\btrade (?:flow|route|pattern)\b",
-        r"\b(?:export|import) (?:volume|data|figure)\b",
-    ],
-    "Market Structure": [
-        r"\b(?:merger|acquisition|takeover)\b",
-        r"\b(?:investment|expansion|capacity)\b",
-        r"\b(?:processing|factory|facility)\b",
-        r"\b(?:certification|standard|quality)\b",
-        r"\b(?:cooperative|association|group)\b",
-        r"\b(?:contract|agreement|deal)\b",
-        r"\b(?:partnership|collaboration)\b",
-        r"\bmarket (?:structure|reform|development)\b",
-    ],
-    "Tech & Innovation": [
-        r"\b(?:technology|innovation|digital)\b",
-        r"\b(?:blockchain|traceability|tracking)\b",
-        r"\b(?:sustainability|sustainable)\b",
-        r"\b(?:efficiency|optimization)\b",
-        r"\b(?:automation|mechanization)\b",
-        r"\b(?:research|development|r&d)\b",
-        r"\b(?:startup|fintech|agtech)\b",
-    ],
-}
-
-# ========================= Streamlit UI CSS =========================
-CARD_CSS = """
+# ---------- CSS ----------
+st.markdown("""
 <style>
 .hero {
-  position: relative;
-  border-radius: 16px;
-  padding: 28px 28px;
-  background: linear-gradient(135deg, #0ea5e9, #7c3aed 60%);
-  color: white;
-  box-shadow: 0 14px 40px rgba(0,0,0,0.18);
+  border-radius: 16px; padding: 24px;
+  background: linear-gradient(135deg, #047857, #0ea5e9 70%);
+  color: white; box-shadow: 0 14px 40px rgba(0,0,0,0.18);
 }
-.hero h1 { margin: 0 0 6px 0; font-size: 28px; font-weight: 800; }
+.hero h1 { margin: 0 0 6px 0; font-size: 26px; font-weight: 800; }
 .hero p { margin: 0; opacity: .95; }
 
-.pill {
-  display: inline-flex; align-items: center; gap: 8px;
-  padding: 6px 12px; border-radius: 999px;
-  background: rgba(255,255,255,0.15); color:#fff; font-weight:600; font-size: 13px;
-}
-
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 16px; }
-.card {
-  background: #ffffff;
-  border: 1px solid rgba(0,0,0,.06);
-  border-radius: 14px; overflow: hidden;
-  transition: transform .15s ease, box-shadow .15s ease;
-}
-.card:hover { transform: translateY(-3px); box-shadow: 0 10px 24px rgba(0,0,0,0.08); }
-.thumb { width: 100%; height: 180px; object-fit: cover; background:#f6f7f9; }
-.card-body { padding: 14px; }
-.card .title { color: #111827 !important; font-weight: 800; font-size: 18px; margin: 6px 0 8px 0; line-height: 1.25; }
-.card .meta { color: #6b7280 !important; font-size: 12px; display:flex; gap:10px; flex-wrap:wrap; margin-bottom:8px; }
-.card .summary { color:#374151 !important; font-size: 13px; line-height:1.55; margin-top: 6px; }
+.card { background:#fff; border:1px solid rgba(0,0,0,.06); border-radius:14px; overflow:hidden; transition:transform .15s, box-shadow .15s; }
+.card:hover { transform: translateY(-3px); box-shadow:0 10px 24px rgba(0,0,0,.08); }
+.thumb { width:100%; height:180px; object-fit:cover; background:#f6f7f9; }
+.card-body { padding:14px; }
+.title { color:#111827 !important; font-weight:800; font-size:18px; margin:6px 0 8px; line-height:1.25; }
+.meta { color:#6b7280 !important; font-size:12px; display:flex; gap:10px; flex-wrap:wrap; margin-bottom:8px; }
+.summary { color:#374151 !important; font-size:13px; line-height:1.55; margin-top:6px; }
 .badges { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0; }
-.badge { font-size: 11px; font-weight:700; padding:4px 8px; border-radius:999px; background:#eef2ff; color:#3730a3; border:1px solid #c7d2fe; }
-.link { text-decoration: none; font-weight:700; color:#2563eb !important; }
+.badge { font-size:11px; font-weight:700; padding:4px 8px; border-radius:999px; background:#eef2ff; color:#3730a3; border:1px solid #c7d2fe; }
+.link { text-decoration:none; font-weight:700; color:#2563eb !important; }
 </style>
-"""
+""", unsafe_allow_html=True)
 
-# ========================= Secrets helpers (no warnings) =========================
-def _get_secret_safely(name: str) -> str:
-    """
-    1) os.environ (works with .env via python-dotenv)
-    2) st.secrets[name] if Secrets are configured
-    Returns "" if missing, without triggering Streamlit's 'No secrets found' banner.
-    """
-    val = os.environ.get(name, "")
-    if val:
-        return str(val).strip().strip('"').strip("'")
+# ---------- Secrets helpers ----------
+def _secret(name: str) -> str:
+    v = os.environ.get(name, "")
+    if v: return v.strip().strip('"').strip("'")
     try:
-        if hasattr(st, "secrets"):
-            try:
-                if len(st.secrets) > 0 and name in st.secrets:
-                    return str(st.secrets.get(name, "")).strip().strip('"').strip("'")
-            except Exception:
-                pass
+        if hasattr(st, "secrets") and name in st.secrets:
+            return str(st.secrets.get(name, "")).strip().strip('"').strip("'")
     except Exception:
         pass
     return ""
 
 def get_newsdata_api_key() -> str:
-    return _get_secret_safely("NEWSDATA_API_KEY")
+    return _secret("NEWSDATA_API_KEY")
 
-def get_openai_api_key() -> str:
-    return _get_secret_safely("OPENAI_API_KEY")
-
-# ========================= HTTP utils + safe wrappers =========================
+# ---------- HTTP utils ----------
 def get_session() -> requests.Session:
-    session = requests.Session()
-    retries = Retry(total=3, backoff_factor=0.6, status_forcelist=[429, 500, 502, 503, 504])
-    session.mount("http://", HTTPAdapter(max_retries=retries))
-    session.mount("https://", HTTPAdapter(max_retries=retries))
-    return session
+    s = requests.Session()
+    s.mount("http://", HTTPAdapter(max_retries=Retry(total=2, backoff_factor=0.5, status_forcelist=[429,500,502,503,504])))
+    s.mount("https://", HTTPAdapter(max_retries=Retry(total=2, backoff_factor=0.5, status_forcelist=[429,500,502,503,504])))
+    return s
 
 def _normalize(text: str) -> str:
-    text = html.unescape(text or "")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", html.unescape(text or "")).strip()
 
-# Global soft error bag
 SOFT_ERRORS: List[str] = []
 def soft_fail(msg: str, detail: Optional[str] = None):
-    if msg:
-        SOFT_ERRORS.append(msg)
-    if detail:
-        logger.warning(detail)
+    if msg: SOFT_ERRORS.append(msg)
+    if detail: logger.warning(detail)
 
-# ========================= Content helpers =========================
-@st.cache_data(ttl=60*30, show_spinner=False)
-def fetch_page(url: str, timeout: int = 12) -> str:
+# ---------- Minimal impact tags ----------
+IMPACT_RULES = {
+    "Supply Risk": [r"\bban\b", r"\bembargo\b", r"\bstrike\b", r"\bshortage\b", r"\bcongestion\b", r"\bharvest\b"],
+    "Price Upside": [r"\brise\b", r"\bspike\b", r"\btightness\b", r"\bpremium\b"],
+    "Price Downside": [r"\bdrop\b", r"\bdecline\b", r"\bglut\b", r"\boversupply\b"],
+    "FX & Policy": [r"\bdevaluation\b", r"\bfx\b", r"\bpolicy\b", r"\btariff\b"],
+    "Logistics & Trade": [r"\bfreight\b", r"\bshipping\b", r"\bport\b", r"\bcontainer\b"],
+}
+
+def classify_impact(text: str) -> List[str]:
+    tags = []
+    lower = text.lower()
+    for label, pats in IMPACT_RULES.items():
+        if any(re.search(p, lower) for p in pats):
+            tags.append(label)
+    return tags or ["General"]
+
+# ---------- Fast relevance ----------
+def hard_hit(text: str, terms: List[str]) -> bool:
+    t = text.lower()
+    return any(re.search(rf"\b{re.escape(k.lower())}\b", t) for k in terms)
+
+def africa_hit(text: str) -> bool:
+    t = text.lower()
+    return any(k in t for k in AFRICAN_HINTS)
+
+def keyword_relevance(text: str, keywords: List[str]) -> float:
+    if not text: return 0.0
+    if HAS_SK:
+        try:
+            vec = TfidfVectorizer(stop_words="english", max_features=3000)
+            X = vec.fit_transform([text, " ".join(keywords)])
+            return float(cosine_similarity(X[0:1], X[1:2])[0][0])
+        except Exception:
+            pass
+    tokens = re.findall(r"[a-zA-Z']{3,}", text.lower())
+    kw = {k.lower() for k in keywords}
+    hits = sum(1 for t in tokens if t in kw)
+    return hits / max(1, len(tokens))
+
+# ---------- Dates ----------
+def parse_date(date_str: str) -> Optional[dt.datetime]:
+    fmts = [
+        "%Y-%m-%dT%H:%M:%S%z","%Y-%m-%dT%H:%M:%SZ","%Y-%m-%d %H:%M:%S",
+        "%a, %d %b %Y %H:%M:%S %z","%a, %d %b %Y %H:%M:%S %Z","%Y-%m-%d",
+        "%d %b %Y","%B %d, %Y"
+    ]
+    for f in fmts:
+        try:
+            return dt.datetime.strptime(date_str, f)
+        except Exception:
+            continue
+    return None
+
+# ---------- RSS (no feedparser) ----------
+ATOM = "{http://www.w3.org/2005/Atom}"
+
+def _text(elem: Optional[ET.Element]) -> str:
+    return _normalize(elem.text if elem is not None and elem.text else "")
+
+def _find(e: ET.Element, tag: str) -> Optional[ET.Element]:
+    x = e.find(tag)
+    if x is not None: return x
+    if not tag.startswith("{"): return e.find(ATOM + tag)
+    return None
+
+def _findall(e: ET.Element, tag: str) -> List[ET.Element]:
+    return list(e.findall(tag)) + list(e.findall(ATOM + tag))
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_feed_raw(url: str, timeout: int = 12) -> bytes:
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; OneAfricaPulse/1.0)",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-        }
-        r = get_session().get(url, headers=headers, timeout=timeout)
+        r = get_session().get(url, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; AfricaCommodityPulse/1.0)",
+            "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
+        }, timeout=timeout, allow_redirects=True)
         if r.status_code != 200:
-            soft_fail("Skipped a page that didn’t load cleanly.", f"fetch_page {url} -> {r.status_code}")
-            return ""
-        return r.text
+            soft_fail("Skipped a source (non-200).", f"{url} -> {r.status_code}")
+        return r.content if r.status_code == 200 else (r.content or b"")
     except Exception as e:
-        soft_fail("Skipped one page due to connectivity.", f"fetch_page EXC {url}: {e}")
-        return ""
+        soft_fail("Skipped one source due to connectivity.", f"fetch_feed_raw EXC {url}: {e}")
+        return b""
 
-def get_og_image(soup: BeautifulSoup, base_url: str) -> Optional[str]:
+def parse_feed(content: bytes, base: str) -> List[Dict[str,str]]:
+    items = []
+    if not content: return items
     try:
-        candidates = [
-            ("meta", {"property": "og:image"}),
-            ("meta", {"name": "twitter:image"}),
-            ("meta", {"property": "twitter:image"}),
-            ("link", {"rel": "image_src"}),
-        ]
-        for tag, attrs in candidates:
-            el = soup.find(tag, attrs=attrs)
-            if el:
-                src = el.get("content") or el.get("href")
-                if src:
-                    if src.startswith("//"):
-                        return "https:" + src
-                    if src.startswith("/"):
-                        return urljoin(base_url, src)
-                    return src
+        root = ET.fromstring(content)
+        ch = root.find("channel")
+        if ch is not None:
+            for it in ch.findall("item"):
+                title = _text(_find(it,"title")) or "(untitled)"
+                link = _text(_find(it,"link"))
+                if not link:
+                    link = _text(_find(it,"guid"))
+                if link.startswith("/"):
+                    link = urljoin(base, link)
+                summary = _text(_find(it,"description"))
+                pub = _text(_find(it,"pubDate"))
+                items.append({"title":title,"link":link,"summary":summary,"published_raw":pub})
+            return items
+        # Atom
+        for en in _findall(root,"entry"):
+            title = _text(_find(en,"title")) or "(untitled)"
+            link_el = _find(en,"link")
+            link = link_el.attrib.get("href","") if link_el is not None else ""
+            if link.startswith("/"):
+                link = urljoin(base, link)
+            summary = _text(_find(en,"summary")) or _text(_find(en,"content"))
+            pub = _text(_find(en,"updated")) or _text(_find(en,"published"))
+            items.append({"title":title,"link":link,"summary":summary,"published_raw":pub})
+        return items
     except Exception as e:
-        logger.info(f"get_og_image: {e}")
+        soft_fail("Skipped one feed with invalid XML.", f"parse_feed EXC {e}")
+        return items
+
+def fetch_from_feed(url: str, start_dt: dt.datetime, end_dt: dt.datetime) -> List[Dict[str,Any]]:
+    raw = fetch_feed_raw(url)
+    base = url
+    out = []
+    for e in parse_feed(raw, base):
+        title = _normalize(e.get("title",""))
+        link = e.get("link","")
+        summary = _normalize(e.get("summary",""))
+        pub = e.get("published_raw","")
+        published_str = "Date unknown"
+        if pub:
+            d = parse_date(pub)
+            if d:
+                d = d.astimezone(dt.timezone.utc) if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
+                if not (start_dt <= d <= end_dt):  # date window
+                    continue
+                published_str = d.strftime("%Y-%m-%d %H:%M UTC")
+        out.append({"source": urlparse(url).netloc, "title": title, "link": link, "summary": summary, "published": published_str})
+    return out
+
+# ---------- Light page scraping (optional slow step) ----------
+def get_og_image(soup: BeautifulSoup, base_url: str) -> Optional[str]:
+    for sel in [("meta",{"property":"og:image"}),("meta",{"name":"twitter:image"}),
+                ("meta",{"property":"twitter:image"}),("link",{"rel":"image_src"})]:
+        el = soup.find(*sel)
+        if el:
+            src = el.get("content") or el.get("href")
+            if src:
+                if src.startswith("//"): return "https:" + src
+                if src.startswith("/"):  return urljoin(base_url, src)
+                return src
     return None
 
 def get_favicon_url(domain_url: str) -> str:
-    parsed = urlparse(domain_url)
-    return f"{parsed.scheme}://{parsed.netloc}/favicon.ico"
+    p = urlparse(domain_url)
+    return f"{p.scheme}://{p.netloc}/favicon.ico"
 
-@st.cache_data(ttl=60*30, show_spinner=False)
-def fetch_article_text_and_image(url: str) -> Tuple[str, str]:
-    if not url:
-        return "", FALLBACK_IMG
-    html_text = fetch_page(url)
-    if not html_text:
-        return "", FALLBACK_IMG
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_article_text_and_image(url: str, timeout: int = 8) -> Tuple[str,str]:
+    if not url: return "", FALLBACK_IMG
     try:
-        soup = BeautifulSoup(html_text, "html.parser")
-        for tag in soup(["script", "style", "noscript", "nav", "footer", "iframe", "form"]):
-            tag.decompose()
+        r = get_session().get(url, headers={"User-Agent":"Mozilla/5.0 (compatible; AfricaCommodityPulse/1.0)"}, timeout=timeout)
+        if r.status_code != 200:
+            return "", FALLBACK_IMG
+        soup = BeautifulSoup(r.text, "html.parser")
+        for tag in soup(["script","style","noscript","nav","footer","iframe","form"]): tag.decompose()
 
-        candidates = []
-        selectors = [
-            "article", "[role='main']", ".article-body", ".story-body",
-            ".post-content", "main", ".content", ".entry-content",
-            "#article-body", ".article-content", ".story-content",
-            ".news-content", ".page-content", "body",
-        ]
-        for sel in selectors:
-            for node in soup.select(sel):
-                text = node.get_text(separator=" ", strip=True)
-                if len(text) > 100:
-                    candidates.append(text)
-        text = max(candidates, key=len) if candidates else soup.get_text(separator=" ", strip=True)
-        text = _normalize(text)
-        if len(text) < 50:
-            text = ""
+        text = ""
+        for sel in ["article","[role='main']",".article-body",".post-content","main",".content",".entry-content",".story-content","body"]:
+            for n in soup.select(sel):
+                t = _normalize(n.get_text(" ", strip=True))
+                if len(t) > len(text): text = t
+        if len(text) < 60: text = ""
 
         img = get_og_image(soup, url) or get_favicon_url(url) or FALLBACK_IMG
         return text, img
-    except Exception as e:
-        soft_fail("Used a fallback image for one article.", f"fetch_article_text_and_image EXC {url}: {e}")
+    except Exception:
         return "", FALLBACK_IMG
 
-# ========================= Relevance & Summary =========================
-def keyword_relevance(text: str, keywords: List[str]) -> float:
-    if not text:
-        return 0.0
-    if HAS_SK:
-        try:
-            vec = TfidfVectorizer(stop_words="english", max_features=5000)
-            X = vec.fit_transform([text, " ".join(keywords)])
-            sim = cosine_similarity(X[0:1], X[1:2])[0][0]
-            return float(sim)
-        except Exception as e:
-            logger.info(f"tfidf relevance fallback: {e}")
-    tokens = re.findall(r"[a-zA-Z']{3,}", text.lower())
-    kwset = {k.lower() for k in keywords}
-    hits = sum(1 for t in tokens if t in kwset)
-    return hits / max(1, len(tokens))
-
-def simple_extractive_summary(text: str, n_sentences: int = 3, keywords: Optional[List[str]] = None) -> str:
-    if not text:
-        return ""
-    sents = re.split(r"(?<=[\.\?\!])\s+", text)
+# ---------- Summaries ----------
+def summarize(text: str, n: int, keywords: List[str]) -> str:
+    if not text: return ""
+    sents = re.split(r"(?<=[.!?])\s+", text)
     sents = [s for s in sents if 30 <= len(s) <= 400][:60]
-    if len(sents) <= n_sentences:
-        return " ".join(sents)
+    if len(sents) <= n: return " ".join(sents)
     if HAS_SK:
         try:
-            vec = TfidfVectorizer(stop_words="english", max_features=8000)
+            vec = TfidfVectorizer(stop_words="english", max_features=4000)
             X = vec.fit_transform(sents)
             centroid = X.mean(axis=0)
             sims = cosine_similarity(X, centroid).ravel()
             if keywords:
                 kw = [k.lower() for k in keywords]
-                boost = np.array([sum(1 for w in re.findall(r"[a-z']+", s.lower()) if w in kw) for s in sents], dtype=float)
-                sims = sims + 0.05 * boost
-            idx = sims.argsort()[-n_sentences:][::-1]
+                sims += 0.05 * np.array([sum(1 for w in re.findall(r"[a-z']+", s.lower()) if w in kw) for s in sents])
+            idx = sims.argsort()[-n:][::-1]
             return " ".join([sents[i] for i in idx])
-        except Exception as e:
-            logger.info(f"summary fallback: {e}")
-    return " ".join(sents[:n_sentences])
-
-def classify_impact(text: str) -> List[str]:
-    tags = []
-    lower = text.lower()
-    for label, patterns in IMPACT_RULES.items():
-        try:
-            if any(re.search(p, lower) for p in patterns):
-                tags.append(label)
         except Exception:
-            continue
-    return list(dict.fromkeys(tags)) or ["General"]
+            pass
+    return " ".join(sents[:n])
 
-def parse_date(date_str: str) -> Optional[dt.datetime]:
-    try:
-        fmts = [
-            "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ",
-            "%Y-%m-%d %H:%M:%S", "%a, %d %b %Y %H:%M:%S %z",
-            "%a, %d %b %Y %H:%M:%S %Z", "%Y-%m-%d",
-            "%d %b %Y", "%B %d, %Y",
-        ]
-        for fmt in fmts:
-            try:
-                return dt.datetime.strptime(date_str, fmt)
-            except ValueError:
-                continue
-    except Exception as e:
-        logger.info(f"parse_date: {e}")
-    return None
-
-# ========================= RSS/Atom parsing (no feedparser) =========================
-ATOM_NS = "{http://www.w3.org/2005/Atom}"
-
-def _text(elem: Optional[ET.Element]) -> str:
-    return _normalize(elem.text if elem is not None and elem.text else "")
-
-def _find(elem: ET.Element, tag: str) -> Optional[ET.Element]:
-    e = elem.find(tag)
-    if e is not None:
-        return e
-    if not tag.startswith("{"):
-        e = elem.find(ATOM_NS + tag)
-    return e
-
-def _findall(elem: ET.Element, tag: str) -> List[ET.Element]:
-    return list(elem.findall(tag)) + list(elem.findall(ATOM_NS + tag))
-
-@st.cache_data(ttl=60*10, show_spinner=False)
-def fetch_feed_raw(url: str, timeout: int = 20) -> bytes:
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0 OneAfricaPulse/1.0",
-            "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
-        }
-        r = get_session().get(url, headers=headers, timeout=timeout, allow_redirects=True)
-        if r.status_code != 200:
-            soft_fail("Skipped a source that returned a non-200 response.", f"fetch_feed_raw {url} -> {r.status_code}")
-        return r.content if r.status_code == 200 else (r.content or b"")
-    except Exception as e:
-        soft_fail("Temporarily skipped one source due to connectivity.", f"fetch_feed_raw EXC {url}: {e}")
-        return b""
-
-def parse_feed_xml(content: bytes, base_url: str) -> List[Dict[str, str]]:
-    items: List[Dict[str, str]] = []
-    if not content:
-        return items
-    try:
-        root = ET.fromstring(content)
-        channel = root.find("channel")
-        if channel is not None:  # RSS
-            for it in channel.findall("item"):
-                title = _text(_find(it, "title")) or "(untitled)"
-                link = _text(_find(it, "link"))
-                if not link:
-                    guid = _find(it, "guid")
-                    link = _text(guid)
-                if link and link.startswith("/"):
-                    link = urljoin(base_url, link)
-                summary = _text(_find(it, "description"))
-                pub = _text(_find(it, "pubDate"))
-                if title or link:
-                    items.append({"title": title, "link": link, "summary": summary, "published_raw": pub})
-            return items
-
-        # Atom
-        for entry in _findall(root, "entry"):
-            title = _text(_find(entry, "title")) or "(untitled)"
-            link_el = _find(entry, "link")
-            link = ""
-            if link_el is not None:
-                link = link_el.attrib.get("href", "") or _text(link_el)
-            if link and link.startswith("/"):
-                link = urljoin(base_url, link)
-            summary = _text(_find(entry, "summary")) or _text(_find(entry, "content"))
-            pub = _text(_find(entry, "updated")) or _text(_find(entry, "published"))
-            if title or link:
-                items.append({"title": title, "link": link, "summary": summary, "published_raw": pub})
-        return items
-    except Exception as e:
-        soft_fail("Skipped one feed that had invalid XML.", f"parse_feed_xml EXC {e}")
-        return items
-
-def validate_feed(url: str, ignore_recency_check: bool = False) -> Tuple[bool, str]:
-    try:
-        content = fetch_feed_raw(url)
-        items = parse_feed_xml(content, base_url=url)
-        if not items:
-            return False, "No entries found"
-        if ignore_recency_check:
-            return True, "OK"
-        now = dt.datetime.now(dt.timezone.utc)
-        for it in items[:10]:
-            d = parse_date(it.get("published_raw", "") or "")
-            if d:
-                d = d.astimezone(dt.timezone.utc) if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
-                if (now - d).days <= 60:
-                    return True, "OK"
-        return False, "No recent entries (≤60 days)"
-    except Exception as ex:
-        soft_fail("Skipped one feed due to a validation issue.", f"validate_feed EXC {url}: {ex}")
-        return False, "Validation error"
-
-def fetch_from_feed(url: str, start_date: dt.datetime, end_date: dt.datetime,
-                    force_fetch: bool, ignore_recency: bool) -> List[Dict[str, Any]]:
-    ok, status = validate_feed(url, ignore_recency_check=ignore_recency)
-    if not ok and not force_fetch:
-        soft_fail(f"Skipped {urlparse(url).netloc} (feed not recent/valid).", f"validate -> {status}")
-        return []
-    raw = fetch_feed_raw(url)
-    raw_items = parse_feed_xml(raw, base_url=url)
-
-    items: List[Dict[str, Any]] = []
-    for e in raw_items:
-        title = _normalize(e.get("title", ""))
-        link = e.get("link", "")
-        summary = _normalize(e.get("summary", ""))
-        published = None
-        if e.get("published_raw"):
-            published = parse_date(e["published_raw"])
-        if published:
-            published = published.astimezone(dt.timezone.utc) if published.tzinfo else published.replace(tzinfo=dt.timezone.utc)
-            if not (start_date <= published <= end_date):
-                continue
-            published_str = published.strftime("%Y-%m-%d %H:%M UTC")
-        else:
-            published_str = "Date unknown"
-        items.append({
-            "source": urlparse(url).netloc,
-            "title": title,
-            "link": link,
-            "published": published_str,
-            "summary": summary,
-        })
-    return items
-
-# ========================= Newsdata.io (optional) =========================
-NEWSDATA_BASE = "https://newsdata.io/api/1/latest"
-
-@st.cache_data(ttl=60*10, show_spinner=False)
-def fetch_from_newsdata_cached(redacted_params: Dict[str, Any], max_pages: int) -> List[Dict[str, Any]]:
-    return []  # placeholder to keep cache signature consistent
-
-def fetch_from_newsdata_runtime(api_key: str, base_params: Dict[str, Any], max_pages: int) -> List[Dict[str, Any]]:
-    session = get_session()
-    items: List[Dict[str, Any]] = []
-    pages = 0
-    next_page = None
-
-    params = dict(base_params)
-    params["apikey"] = api_key
-
-    while pages < max_pages:
-        try:
-            q = dict(params)
-            if next_page:
-                q["page"] = next_page
-            r = session.get(NEWSDATA_BASE, params=q, timeout=20)
-            if r.status_code != 200:
-                soft_fail("One API page was skipped (non-200).", f"newsdata {r.status_code} {r.text[:200]}")
-                break
-            data = r.json()
-            results = data.get("results") or data.get("articles") or []
-            for a in results:
-                items.append(a)
-            next_page = data.get("nextPage") or data.get("next_page")
-            pages += 1
-            if not next_page:
-                break
-        except Exception as e:
-            soft_fail("Temporarily skipped an API page due to connectivity.", f"newsdata EXC {e}")
-            break
-    return items
-
-def fetch_from_newsdata(
-    api_key: str,
-    query: str,
-    start_date: dt.datetime,
-    end_date: dt.datetime,
-    language: Optional[str] = None,
-    country: Optional[str] = None,
-    category: Optional[str] = None,
-    max_pages: int = 2,
-) -> List[Dict[str, Any]]:
-    if not api_key:
-        return []
-    redacted = {"q": query or ""}
-    if language: redacted["language"] = language
-    if country: redacted["country"] = country
-    if category: redacted["category"] = category
-
-    _ = fetch_from_newsdata_cached(redacted, max_pages=max_pages)
-    items_raw = fetch_from_newsdata_runtime(api_key=api_key, base_params=redacted, max_pages=max_pages)
-
-    items: List[Dict[str, Any]] = []
-    for a in items_raw:
-        try:
-            title = _normalize(a.get("title", ""))
-            link = a.get("link") or a.get("url") or ""
-            source = a.get("source_id") or a.get("source") or "newsdata.io"
-            pub = a.get("pubDate") or a.get("published_at") or ""
-            desc = _normalize(a.get("description", "")) or _normalize(a.get("content", ""))
-
-            ok_date = True
-            published_str = "Date unknown"
-            if pub:
-                d = parse_date(pub)
-                if d:
-                    d = d.astimezone(dt.timezone.utc) if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
-                    ok_date = start_date <= d <= end_date
-                    published_str = d.strftime("%Y-%m-%d %H:%M UTC")
-            if not ok_date:
-                continue
-            items.append({
-                "source": f"{source} (newsdata.io)",
-                "title": title or "(untitled)",
-                "link": link,
-                "published": published_str,
-                "summary": desc,
-            })
-        except Exception as e:
-            soft_fail("Skipped one API item due to missing fields.", f"newsdata item EXC {e}")
-            continue
-    return items
-
-# ========================= UI Helpers =========================
+# ---------- UI: hero ----------
 st.set_page_config(page_title=APP_NAME, page_icon="🌍", layout="wide", initial_sidebar_state="expanded")
-st.markdown(CARD_CSS, unsafe_allow_html=True)
+st.markdown(f"""
+<div class="hero">
+  <h1>{APP_NAME}</h1>
+  <p>{TAGLINE}</p>
+  <p style="opacity:.9;">{QUOTE}</p>
+</div>
+""", unsafe_allow_html=True)
+st.markdown("<br>", unsafe_allow_html=True)
+
+# ---------- Action bar ----------
+c1, c2 = st.columns([1,1])
+with c1:
+    run_btn = st.button("🚀 Scan Now", use_container_width=True)
+with c2:
+    if st.button("♻️ Reset", use_container_width=True):
+        st.session_state.clear()
+        st.rerun()
+
+# ---------- Config sidebar ----------
+with st.sidebar:
+    with st.expander("⚙️ Configurations", expanded=False):
+        st.subheader("Feeds (Africa & commodities)")
+        chosen_sources: List[str] = []
+        for name, url in DEFAULT_SOURCES.items():
+            if st.checkbox(name, value=True, key=f"src_{name}"):
+                chosen_sources.append(url)
+        st.caption("You can paste more RSS/Atom URLs below (one per line):")
+        extra = st.text_area("Extra feeds", value="", height=80, key="extra_feeds")
+        for line in (extra or "").splitlines():
+            u = line.strip()
+            if u.startswith("http"):
+                chosen_sources.append(u)
+
+        st.markdown("---")
+        st.subheader("Window & Limits")
+        mode = st.radio("Date mode", ["Quick", "Custom"], horizontal=True)
+        if mode == "Quick":
+            quick = {"24h":1,"3d":3,"7d":7,"14d":14,"30d":30}
+            sel = st.selectbox("Range", list(quick.keys()), index=2)
+            end_date = dt.datetime.now(dt.timezone.utc)
+            start_date = end_date - dt.timedelta(days=quick[sel])
+        else:
+            d1, d2 = st.columns(2)
+            with d1: sd = st.date_input("Start", value=dt.date.today()-dt.timedelta(days=7))
+            with d2: ed = st.date_input("End", value=dt.date.today())
+            start_date = dt.datetime.combine(sd, dt.time.min, tzinfo=dt.timezone.utc)
+            end_date   = dt.datetime.combine(ed, dt.time.max, tzinfo=dt.timezone.utc)
+
+        per_source_cap = st.number_input("Per-source cap", 1, 100, 15, 1)
+        overall_cap    = st.number_input("Overall cap (after filters)", 10, 500, 120, 10)
+        top_k_fulltext = st.number_input("Fetch full pages for top K / source", 0, 30, 5, 1)
+        timeout_s      = st.number_input("Network timeout (sec)", 4, 30, 8, 1)
+
+        st.markdown("---")
+        st.subheader("Relevance Filters")
+        africa_only = st.checkbox("Africa-only filter", value=True)
+        strict_titles = st.checkbox("Require commodity term in title/summary", value=True)
+        hard_terms_edit = st.text_input("Commodity terms (comma-separated)", ", ".join(TARGET_TERMS))
+        hard_terms = [t.strip() for t in hard_terms_edit.split(",") if t.strip()]
+        kw_text = st.text_area("Soft keywords (scoring)", ", ".join(DEFAULT_KEYWORDS), height=100)
+        soft_keywords = [k.strip() for k in kw_text.split(",") if k.strip()]
+        min_rel = st.slider("Min soft relevance", 0.0, 1.0, 0.10, 0.01)
+
+        st.markdown("---")
+        st.subheader("Performance")
+        fast_mode = st.checkbox("Fast mode (no full-text scraping)", value=True)
+        workers = st.number_input("Concurrency (threads)", 2, 16, 6, 1)
+
+        st.markdown("---")
+        st.subheader("Newsdata.io (optional)")
+        use_nd = st.checkbox("Use Newsdata.io", value=False)
+        nd_key = get_newsdata_api_key()
+        if use_nd and not nd_key:
+            st.warning("Add NEWSDATA_API_KEY to .env or Streamlit Secrets to enable Newsdata.")
+        nd_query = st.text_input("Query", "(cashew OR shea OR cocoa OR gold OR oil) AND (Africa OR Ghana OR Nigeria OR Côte d’Ivoire)")
+        nd_pages = st.number_input("API pages", 1, 10, 2, 1)
+
+# ---------- Fetchers ----------
+def prefilter_item(t: str, s: str) -> bool:
+    # 1) commodity term check
+    if strict_titles and not (hard_hit(t, hard_terms) or hard_hit(s, hard_terms)):
+        return False
+    # 2) Africa-only
+    if africa_only and not (africa_hit(t) or africa_hit(s)):
+        return False
+    return True
+
+def enrich_fast(entry: Dict[str,Any]) -> Optional[Dict[str,Any]]:
+    try:
+        title = entry["title"] or "(untitled)"
+        summary = entry.get("summary","")
+        if not prefilter_item(title, summary):
+            return None
+        combo = " ".join([title, summary])
+        rel = keyword_relevance(combo, soft_keywords)
+        if rel < min_rel:
+            return None
+        impacts = classify_impact(combo)
+        return {
+            "source": entry["source"],
+            "title": title,
+            "link": entry["link"],
+            "published": entry["published"],
+            "relevance": float(rel),
+            "impact": impacts,
+            "auto_summary": summarize(summary or title, 3, soft_keywords),
+            "image": FALLBACK_IMG,
+        }
+    except Exception as e:
+        soft_fail("Skipped one item (fast enrich).", f"enrich_fast EXC {e}")
+        return None
+
+def enrich_full(entry: Dict[str,Any]) -> Optional[Dict[str,Any]]:
+    try:
+        title = entry["title"] or "(untitled)"
+        summary = entry.get("summary","")
+        if not prefilter_item(title, summary):
+            return None
+
+        # fetch full page ONLY now
+        body, img = fetch_article_text_and_image(entry["link"], timeout=timeout_s)
+        text_for_score = " ".join([title, body or summary])
+        rel = keyword_relevance(text_for_score, soft_keywords)
+        if rel < min_rel:
+            return None
+
+        impacts = classify_impact(text_for_score)
+        return {
+            "source": entry["source"],
+            "title": title,
+            "link": entry["link"],
+            "published": entry["published"],
+            "relevance": float(rel),
+            "impact": impacts,
+            "auto_summary": summarize(body or summary or title, 3, soft_keywords),
+            "image": img or FALLBACK_IMG,
+        }
+    except Exception as e:
+        soft_fail("Skipped one item (full enrich).", f"enrich_full EXC {e}")
+        return None
+
+def fetch_all(sources: List[str]) -> List[Dict[str,Any]]:
+    rows: List[Dict[str,Any]] = []
+    if not sources and not use_nd:
+        return rows
+
+    progress = st.progress(0.0)
+    info = st.empty()
+
+    # 1) RSS scan (FAST)
+    raw_items: List[Dict[str,Any]] = []
+    for i, src in enumerate(sources, start=1):
+        info.info(f"Fetching {urlparse(src).netloc} ({i}/{max(1,len(sources))}) …")
+        try:
+            items = fetch_from_feed(src, start_date, end_date)
+            if per_source_cap: items = items[:per_source_cap]
+            # quick prefilter on title/summary before any heavy work
+            items = [it for it in items if prefilter_item(it["title"], it.get("summary",""))]
+            raw_items.extend(items)
+        except Exception as e:
+            soft_fail("Skipped one source due to a transient issue.", f"{src} EXC {e}")
+        progress.progress(min(0.6, i/max(1,len(sources))*0.6))  # first 60%
+
+    # 2) Optional Newsdata
+    if use_nd and nd_key:
+        info.info("Fetching Newsdata.io …")
+        try:
+            items = []
+            next_page = None
+            for _ in range(int(nd_pages)):
+                q = {"apikey": nd_key, "q": nd_query}
+                if next_page: q["page"] = next_page
+                r = get_session().get("https://newsdata.io/api/1/latest", params=q, timeout=timeout_s)
+                if r.status_code != 200:
+                    soft_fail("One API page was skipped.", f"newsdata {r.status_code} {r.text[:200]}")
+                    break
+                data = r.json()
+                results = data.get("results") or []
+                for a in results:
+                    title = _normalize(a.get("title",""))
+                    link = a.get("link") or a.get("url") or ""
+                    desc = _normalize(a.get("description","")) or _normalize(a.get("content",""))
+                    pub  = a.get("pubDate") or a.get("published_at") or ""
+                    published_str = "Date unknown"
+                    ok_date = True
+                    if pub:
+                        d = parse_date(pub)
+                        if d:
+                            d = d.astimezone(dt.timezone.utc) if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
+                            ok_date = start_date <= d <= end_date
+                            published_str = d.strftime("%Y-%m-%d %H:%M UTC")
+                    if not ok_date: continue
+                    items.append({"source":"newsdata.io", "title":title, "link":link, "summary":desc, "published":published_str})
+                next_page = data.get("nextPage") or data.get("next_page")
+                if not next_page: break
+            if per_source_cap: items = items[:per_source_cap]
+            items = [it for it in items if prefilter_item(it["title"], it.get("summary",""))]
+            raw_items.extend(items)
+        except Exception as e:
+            soft_fail("API temporarily unavailable.", f"newsdata EXC {e}")
+
+    if not raw_items:
+        info.empty(); progress.empty()
+        return rows
+
+    # 3) Enrich: either fast or 2-stage (topK fulltext)
+    info.info("Scoring & summarizing …")
+    rows_fast: List[Dict[str,Any]] = []
+    with ThreadPoolExecutor(max_workers=int(workers)) as ex:
+        futures = [ex.submit(enrich_fast, it) for it in raw_items]
+        for i, fut in enumerate(as_completed(futures), start=1):
+            r = fut.result()
+            if r: rows_fast.append(r)
+            if i % 10 == 0:
+                progress.progress(0.6 + min(0.2, i/len(raw_items)*0.2))  # to 80%
+
+    rows_fast = [r for r in rows_fast if r]
+    rows_fast.sort(key=lambda x: x["relevance"], reverse=True)
+
+    # If fast mode, we're done
+    if fast_mode or top_k_fulltext == 0:
+        final_rows = rows_fast[:int(overall_cap)]
+        info.empty(); progress.progress(1.0); progress.empty()
+        return final_rows
+
+    # Else fetch full text for top K per source (speed + quality)
+    info.info("Fetching full articles for top items …")
+    # bucket by source
+    by_src: Dict[str, List[Dict[str,Any]]] = {}
+    for r in rows_fast:
+        by_src.setdefault(r["source"], []).append(r)
+
+    candidates: List[Dict[str,Any]] = []
+    for src, bucket in by_src.items():
+        candidates.extend(bucket[:int(top_k_fulltext)])
+
+    final_rows: List[Dict[str,Any]] = []
+    with ThreadPoolExecutor(max_workers=int(workers)) as ex:
+        futures = [ex.submit(enrich_full, it) for it in candidates]
+        for i, fut in enumerate(as_completed(futures), start=1):
+            r = fut.result()
+            if r: final_rows.append(r)
+            if i % 10 == 0:
+                progress.progress(0.8 + min(0.2, i/max(1,len(candidates))*0.2))  # to 100%
+
+    # merge: prefer full rows, then fill with fast rows if needed
+    def keyer(x): return hashlib.md5((x["title"]+"||"+x["link"]).encode()).hexdigest()
+    full_keys = {keyer(r) for r in final_rows}
+    spill = [r for r in rows_fast if keyer(r) not in full_keys]
+    final = (final_rows + spill)[:int(overall_cap)]
+
+    info.empty(); progress.progress(1.0); progress.empty()
+    return final
+
+# ---------- Rendering ----------
+def render_card(row: pd.Series):
+    st.markdown(f"""
+    <div class="card">
+      <img class="thumb" src="{row.get('image',FALLBACK_IMG)}" alt="thumbnail">
+      <div class="card-body">
+        <div class="meta">{row['source']} · {row['published']} · Relevance {row['relevance']:.0%}</div>
+        <div class="title">{row['title']}</div>
+        <div class="badges">{"".join([f'<span class="badge">{t}</span>' for t in row["impact"]])}</div>
+        <div class="summary">{row['auto_summary']}</div>
+        <div style="margin-top:10px;"><a class="link" href="{row['link']}" target="_blank">Read full article →</a></div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
 
 def make_digest(df: pd.DataFrame, top_k: int = 12) -> str:
     header = f"# {APP_NAME} — Daily Digest\n\n*{TAGLINE}*\n\n> {QUOTE}\n\n"
@@ -619,459 +627,80 @@ def make_digest(df: pd.DataFrame, top_k: int = 12) -> str:
         return header + "_No relevant items found for the selected period._"
     parts = [header, f"**Date:** {dt.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"]
     for _, row in df.head(top_k).iterrows():
-        impact = ", ".join(row["impact"])
         parts.append(
             f"### {row['title']}\n"
             f"- **Source:** {row['source']}  \n"
             f"- **Published:** {row['published']}  \n"
             f"- **Relevance:** {row['relevance']:.3f}  \n"
-            f"- **Impact:** {impact}  \n"
+            f"- **Impact:** {', '.join(row['impact'])}  \n"
             f"- **Summary:** {row['auto_summary']}\n"
             f"[Read more]({row['link']})\n\n---\n"
         )
     return "\n".join(parts)
 
-# ======= HERO =======
-with st.container():
-    st.markdown(f"""
-    <div class="hero">
-        <div class="pill">🌍 One Africa Market Pulse</div>
-        <h1>{TAGLINE}</h1>
-        <p>{QUOTE}</p>
-    </div>
-    """, unsafe_allow_html=True)
+def friendly_error_summary():
+    if not SOFT_ERRORS: return
+    counts: Dict[str,int] = {}
+    for m in SOFT_ERRORS: counts[m] = counts.get(m,0)+1
+    bullets = "".join([f"- {msg} _(x{n})_\n" for msg,n in counts.items()])
+    st.info(f"**Heads up:** Some sources were skipped/slow, but results are complete.\n\n{bullets}")
 
-# ======= ACTION BAR =======
-st.markdown("<br>", unsafe_allow_html=True)
-act_b1, act_b2 = st.columns([1, 1])
-with act_b1:
-    run_btn = st.button("🚀 Scan Now", use_container_width=True, key="run_main")
-with act_b2:
-    if st.button("♻️ Reset", use_container_width=True, key="reset_main"):
-        st.session_state.clear()
-        st.rerun()
-
-# ======= CHAT ASSISTANT (resilient with fallbacks) =======
-st.markdown("### 🤖 Chat Assistant")
-st.caption("Ask follow-ups, draft digests, or generate summaries. Uses your `.env`/Secrets OPENAI_API_KEY if available.")
-
-def init_chat_state():
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = [
-            {"role": "system", "content": (
-                "You are a crisp market-intelligence assistant for West African tree crops "
-                "(cashew, shea, cocoa, palm kernel). Be concise, cite assumptions, and suggest "
-                "actionable next steps. If asked to summarize a table, write bullet points."
-            )}
-        ]
-init_chat_state()
-
-def have_openai():
-    return OPENAI_OK and bool(get_openai_api_key())
-
-def get_openai_client():
-    try:
-        # If you use the standard OpenAI endpoint, remove base_url arg.
-        # This base_url was in your last version; keeping as-is.
-        return OpenAI(api_key=get_openai_api_key(), base_url="https://models.github.ai/inference")
-    except Exception as e:
-        logger.warning(f"OpenAI client init failed: {e}")
-        return None
-
-def generate_assistant_reply(messages, temperature: float = 0.4):
-    """
-    Try models in order; stream first, then non-stream fallback.
-    Return (text_or_None, streamed_bool). Never raises to UI.
-    """
-    if not have_openai():
-        return None, False
-    client = get_openai_client()
-    if client is None:
-        return None, False
-
-    model_candidates = [
-        "gpt-4o-mini",
-        "gpt-4o",
-        "gpt-4.1-mini",
-        "gpt-3.5-turbo-0125",
-    ]
-
-    last_err = None
-    for model in model_candidates:
-        # 1) streaming
-        try:
-            stream = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                stream=True,
-                temperature=temperature,
-            )
-            chunks = []
-            with st.chat_message("assistant"):
-                placeholder = st.empty()
-                buf = ""
-                for chunk in stream:
-                    delta = chunk.choices[0].delta.content or ""
-                    if delta:
-                        buf += delta
-                        placeholder.markdown(buf)
-                chunks.append(buf)
-            reply = "".join(chunks).strip()
-            if reply:
-                return reply, True
-        except Exception as e:
-            logger.warning(f"OpenAI streaming failed on {model}: {e}")
-            last_err = e
-
-        # 2) non-stream fallback
-        try:
-            comp = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-            )
-            reply = (comp.choices[0].message.content or "").strip()
-            if reply:
-                # NOTE: We don't render here to avoid double-rendering.
-                return reply, False
-        except Exception as e2:
-            logger.warning(f"OpenAI non-streaming failed on {model}: {e2}")
-            last_err = e2
-            continue
-
-    soft_fail("Assistant is temporarily unavailable.", f"OpenAI failures: {last_err}")
-    return None, False
-
-# Render prior chat (omit system)
-for m in st.session_state.chat_history:
-    if m["role"] == "system":
-        continue
-    with st.chat_message(m["role"]):
-        st.markdown(m["content"])
-
-# Chat input
-user_prompt = st.chat_input("Type your message...")
-if user_prompt:
-    st.session_state.chat_history.append({"role": "user", "content": user_prompt})
-    with st.chat_message("user"):
-        st.markdown(user_prompt)
-
-    if not have_openai():
-        with st.chat_message("assistant"):
-            st.warning("No `OPENAI_API_KEY` found (in `.env` or Streamlit Secrets). Add it and press **Reset**.")
-    else:
-        reply, _streamed = generate_assistant_reply(st.session_state.chat_history)
-        if reply:
-            # >>> FIX: if not streamed, render immediately so user sees it now
-            if not _streamed:
-                with st.chat_message("assistant"):
-                    st.markdown(reply)
-            st.session_state.chat_history.append({"role": "assistant", "content": reply})
-        else:
-            with st.chat_message("assistant"):
-                st.error("The assistant is temporarily unavailable. Please try again in a moment.")
-
-# ========================= SINGLE COLLAPSIBLE CONFIG PANEL =========================
-with st.sidebar:
-    with st.expander("⚙️ Configurations", expanded=False):
-        st.header("Settings")
-
-        # 📰 RSS/Atom Sources
-        st.subheader("📰 RSS/Atom Sources")
-        chosen_sources: List[str] = []
-        for name, url in DEFAULT_SOURCES.items():
-            if st.checkbox(name, value=True, key=f"src_{name}"):
-                chosen_sources.append(url)
-        if st.button("🔄 Check Feeds", key="check_feeds"):
-            for name, url in DEFAULT_SOURCES.items():
-                ok, status = validate_feed(url, ignore_recency_check=True)
-                st.write(f"{'✅' if ok else '❌'} {name}: {status}")
-
-        st.markdown("---")
-
-        # 🧩 Newsdata.io (optional)
-        st.subheader("🧩 Newsdata.io (optional)")
-        st.caption("Merge API headlines with the same scoring & summaries.")
-        use_newsdata = st.checkbox("Use Newsdata.io", value=True, key="use_nd")
-
-        auto_key = get_newsdata_api_key()
-        override = st.checkbox("Temporarily override API key (not saved)", value=False, key="nd_override")
-        tmp_key = st.text_input("Enter API key", type="password", key="nd_key_input") if override else ""
-        newsdata_key = (tmp_key or auto_key).strip()
-
-        if use_newsdata:
-            if newsdata_key:
-                st.success("Using secured API key.")
-            else:
-                st.warning("No API key found. Add NEWSDATA_API_KEY to `.env`/Secrets, or use a temporary override.")
-
-        newsdata_query = st.text_input("Query", value="tree crop commodities", key="nd_query")
-        c1, c2, c3 = st.columns(3)
-        with c1: nd_language = st.text_input("Language (e.g., en, fr)", value="", key="nd_lang")
-        with c2: nd_country = st.text_input("Country (e.g., gh, ng, ci)", value="", key="nd_cty")
-        with c3: nd_category = st.text_input("Category (e.g., business)", value="", key="nd_cat")
-        nd_pages = st.number_input("Newsdata pages", min_value=1, max_value=10, value=2, step=1, key="nd_pages")
-
-        st.markdown("---")
-
-        # 📅 Date Range
-        st.subheader("📅 Date Range")
-        mode = st.radio("Mode", ["Quick Select", "Custom"], horizontal=True, key="date_mode")
-        if mode == "Quick Select":
-            quick = {"Last 24 Hours": 1, "Last 3 Days": 3, "Last Week": 7, "Last 2 Weeks": 14, "Last Month": 30}
-            sel = st.selectbox("Window", list(quick.keys()), index=2, key="date_win")
-            end_date = dt.datetime.now(dt.timezone.utc)
-            start_date = end_date - dt.timedelta(days=quick[sel])
-        else:
-            d1, d2 = st.columns(2)
-            with d1: sd = st.date_input("Start", value=dt.date.today() - dt.timedelta(days=7), key="start_date")
-            with d2: ed = st.date_input("End", value=dt.date.today(), key="end_date")
-            start_date = dt.datetime.combine(sd, dt.time.min, tzinfo=dt.timezone.utc)
-            end_date = dt.datetime.combine(ed, dt.time.max, tzinfo=dt.timezone.utc)
-
-        st.markdown("---")
-
-        # 🔍 Keywords & Filters
-        st.subheader("🔍 Keywords & Filters")
-        custom_kw = st.text_area("Keywords (comma-separated)", ", ".join(DEFAULT_KEYWORDS), height=100, key="kw_text")
-        keywords = [k.strip() for k in custom_kw.split(",") if k.strip()]
-        min_relevance = st.number_input("Min relevance (0.00–1.00)", min_value=0.0, max_value=1.0, value=0.05, step=0.01, format="%.2f", key="min_rel")
-        per_source_cap = st.number_input("Max articles per source", min_value=1, max_value=200, value=20, step=1, key="cap")
-
-        st.markdown("---")
-
-        # 📝 Content Settings
-        st.subheader("📝 Content Settings")
-        n_sent = st.number_input("Sentences per summary", min_value=2, max_value=10, value=3, step=1, key="n_sent")
-        top_k = st.number_input("Digest: top items", min_value=5, max_value=100, value=12, step=1, key="top_k")
-
-        st.markdown("---")
-
-        # 🛡️ Resilience
-        st.subheader("🛡️ Resilience")
-        force_fetch = st.checkbox("⚡ Force RSS fetch if validation fails", value=True, key="force")
-        ignore_recency = st.checkbox("🕒 Ignore RSS recency check", value=True, key="ignore_recent")
-        dedupe_across_sources = st.checkbox("🧹 Deduplicate across sources", value=True, key="dedupe")
-
-# ========================= Processing =========================
-def hash_key(*parts) -> str:
-    return hashlib.md5(("||".join([p or "" for p in parts])).encode("utf-8")).hexdigest()
-
-def process_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
-    if not rows:
-        return pd.DataFrame(columns=["source","published","title","relevance","impact","auto_summary","link","image"])
-    seen = set()
-    cleaned = []
+def process_rows(rows: List[Dict[str,Any]]) -> pd.DataFrame:
+    if not rows: return pd.DataFrame(columns=["source","published","title","relevance","impact","auto_summary","link","image"])
+    seen=set(); cleaned=[]
     for r in rows:
-        key = hash_key(r.get("title",""), r.get("link",""))
-        if key in seen:
-            continue
-        seen.add(key)
-        cleaned.append(r)
+        k = hashlib.md5((r["title"]+"||"+r["link"]).encode()).hexdigest()
+        if k in seen: continue
+        seen.add(k); cleaned.append(r)
     df = pd.DataFrame(cleaned)
-    if df.empty:
-        return pd.DataFrame(columns=["source","published","title","relevance","impact","auto_summary","link","image"])
+    if df.empty: return df
     return df.sort_values("relevance", ascending=False).reset_index(drop=True)
 
-def enrich(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    try:
-        article_text, image_url = fetch_article_text_and_image(entry.get("link",""))
-        base = entry.get("summary") or ""
-        body = article_text if len(article_text) > len(base) else base
-
-        rel = keyword_relevance(" ".join([entry.get("title",""), body]), keywords)
-        if rel < min_relevance:
-            return None
-        summary = simple_extractive_summary(body, n_sentences=n_sent, keywords=keywords)
-        impacts = classify_impact(" ".join([entry.get("title",""), body])) or ["General"]
-
-        return {
-            "source": entry.get("source",""),
-            "title": entry.get("title","(untitled)"),
-            "link": entry.get("link",""),
-            "published": entry.get("published","Date unknown"),
-            "relevance": float(rel),
-            "impact": impacts,
-            "auto_summary": summary,
-            "image": image_url or FALLBACK_IMG,
-        }
-    except Exception as e:
-        soft_fail("Skipped one article that couldn’t be processed.", f"enrich EXC {e}")
-        return None
-
-def fetch_all(chosen_sources: List[str]) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    total_tasks = len(chosen_sources) + (1 if (use_newsdata and newsdata_key) else 0)
-    total_tasks = max(total_tasks, 1)
-    progress = st.progress(0.0)
-    info = st.empty()
-
-    # 1) RSS/Atom
-    for i, src in enumerate(chosen_sources, start=1):
-        info.info(f"Fetching RSS {i}/{total_tasks}: {urlparse(src).netloc}")
-        try:
-            raw_items = fetch_from_feed(src, start_date, end_date, force_fetch, ignore_recency)
-        except Exception as e:
-            soft_fail("Skipped a source due to a transient issue.", f"fetch_from_feed EXC {src}: {e}")
-            raw_items = []
-        if per_source_cap and raw_items:
-            raw_items = raw_items[:per_source_cap]
-
-        if raw_items:
-            with ThreadPoolExecutor(max_workers=6) as ex:
-                futures = [ex.submit(enrich, {**e, "source": urlparse(src).netloc}) for e in raw_items]
-                for fut in as_completed(futures):
-                    try:
-                        r = fut.result()
-                        if r: rows.append(r)
-                    except Exception as e:
-                        soft_fail("One article was skipped during processing.", f"future enrich EXC {e}")
-        progress.progress(min(1.0, i / total_tasks))
-
-    # 2) Newsdata.io
-    if use_newsdata and newsdata_key:
-        info.info(f"Fetching Newsdata.io {len(chosen_sources)+1}/{total_tasks}")
-        try:
-            nd_items = fetch_from_newsdata(
-                api_key=newsdata_key,
-                query=newsdata_query,
-                start_date=start_date,
-                end_date=end_date,
-                language=nd_language or None,
-                country=nd_country or None,
-                category=nd_category or None,
-                max_pages=int(nd_pages),
-            )
-            if per_source_cap and nd_items:
-                nd_items = nd_items[:per_source_cap]
-            if nd_items:
-                with ThreadPoolExecutor(max_workers=6) as ex:
-                    futures = [ex.submit(enrich, it) for it in nd_items]
-                    for fut in as_completed(futures):
-                        try:
-                            r = fut.result()
-                            if r: rows.append(r)
-                        except Exception as e:
-                            soft_fail("One API article was skipped during processing.", f"future API enrich EXC {e}")
-        except Exception as e:
-            soft_fail("The API was briefly unavailable; results shown are from RSS.", f"fetch_from_newsdata EXC {e}")
-        progress.progress(1.0)
-
-    info.empty()
-    progress.empty()
-    return rows
-
-def render_card(row: pd.Series):
-    pub = row["published"]
-    src = row["source"]
-    rel = f"{row['relevance']:.0%}"
-    title = row["title"]
-    link = row["link"]
-    img = row["image"] or FALLBACK_IMG
-    summary = row["auto_summary"] or ""
-    st.markdown(f"""
-    <div class="card">
-      <img class="thumb" src="{img}" alt="thumbnail">
-      <div class="card-body">
-        <div class="meta">{src} · {pub} · Relevance {rel}</div>
-        <div class="title">{title}</div>
-        <div class="badges">
-            {"".join([f'<span class="badge">{t}</span>' for t in row["impact"]])}
-        </div>
-        <div class="summary">{summary}</div>
-        <div style="margin-top:10px;">
-          <a class="link" href="{link}" target="_blank">Read full article →</a>
-        </div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-def ui_results(df: pd.DataFrame, top_k: int):
+def ui_results(df: pd.DataFrame):
     st.subheader("📊 Results")
     if df.empty:
-        st.warning("No relevant articles found. Try widening the date range or lowering the relevance threshold.")
+        st.warning("No relevant articles found. Try widening date range or relaxing filters.")
         return
-
     c1, c2 = st.columns(2)
     with c1:
-        all_impacts = sorted({t for tags in df["impact"] for t in tags})
-        impact_filter = st.multiselect("Filter by impact", options=all_impacts, default=[])
+        impacts = sorted({t for tags in df["impact"] for t in tags})
+        f_imp = st.multiselect("Filter by impact", impacts, [])
     with c2:
-        source_filter = st.multiselect("Filter by source", options=sorted(df["source"].unique()), default=[])
-
-    filtered = df.copy()
-    if impact_filter:
-        filtered = filtered[filtered["impact"].apply(lambda x: any(t in x for t in impact_filter))]
-    if source_filter:
-        filtered = filtered[filtered["source"].isin(source_filter)]
+        f_src = st.multiselect("Filter by source", sorted(df["source"].unique()), [])
+    filt = df.copy()
+    if f_imp: filt = filt[filt["impact"].apply(lambda x: any(t in x for t in f_imp))]
+    if f_src: filt = filt[filt["source"].isin(f_src)]
 
     st.markdown('<div class="grid">', unsafe_allow_html=True)
-    for _, row in filtered.iterrows():
+    for _, row in filt.iterrows():
         render_card(row)
     st.markdown('</div>', unsafe_allow_html=True)
 
     st.subheader("📝 Daily Digest")
-    digest_md = make_digest(filtered if (impact_filter or source_filter) else df, top_k=top_k)
+    digest_md = make_digest(filt if (f_imp or f_src) else df, top_k=12)
     st.markdown(digest_md)
 
-    st.subheader("⬇️ Downloads")
     ts = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    export_df = filtered if (impact_filter or source_filter) else df
-    csv_name = f"oneafrica_pulse_{ts}.csv"
-    md_name = f"oneafrica_pulse_digest_{ts}.md"
-    st.download_button("📥 Download CSV", data=export_df.to_csv(index=False).encode("utf-8"),
-                       file_name=csv_name, mime="text/csv")
+    st.download_button("📥 Download CSV", data=filt.to_csv(index=False).encode("utf-8"),
+        file_name=f"africa_commodity_pulse_{ts}.csv", mime="text/csv")
     st.download_button("📥 Download Digest (Markdown)", data=digest_md.encode("utf-8"),
-                       file_name=md_name, mime="text/markdown")
-    st.info("💡 Tip: Paste the Markdown into an email, WhatsApp (as a code block), or your wiki for quick sharing.")
+        file_name=f"africa_commodity_pulse_digest_{ts}.md", mime="text/markdown")
 
-def friendly_error_summary():
-    if not SOFT_ERRORS:
-        return
-    counts: Dict[str,int] = {}
-    for m in SOFT_ERRORS:
-        counts[m] = counts.get(m, 0) + 1
-    bullets = "".join([f"- {msg} _(x{n})_\n" for msg, n in counts.items()])
-    st.info(f"""
-**Heads up:** Some sources were temporarily skipped or partially loaded.  
-This doesn’t affect your ability to scan and summarize current items.
-
-{bullets}
-    """)
-
-# ========================= Main =========================
-st.markdown(CARD_CSS, unsafe_allow_html=True)
-
-if 'run_btn' not in locals():
-    run_btn = False  # safety
-
+# ---------- Main ----------
 if not run_btn:
-    st.info("""
-**What this demo does:**
-- 📰 Scans curated RSS/Atom feeds (+ optional Newsdata.io API) for the last *N* days  
-- 📑 Fetches full article text where possible + **thumbnails** (Open Graph)  
-- 🎯 Scores relevance against **your commodity & policy keywords**  
-- 📝 Auto-summarizes into 2–6 sentences  
-- 🏷️ Tags each item (Supply Risk, FX & Policy, Logistics, etc.)  
-- 💾 Outputs a **downloadable CSV** and **Daily Digest (Markdown)**
-    """)
+    st.info("""**What this does**
+- Prioritizes **Africa** + **cashew/shea/cocoa/gold/oil**
+- Fast scan of RSS/Atom, then (optionally) fetches full pages for the **top K** only
+- Strict title/summary filter keeps noise out; soft relevance rescoring ranks results
+- Friendly errors (no tracebacks), CSV + Markdown digest""")
 else:
     try:
-        if 'chosen_sources' not in locals():
-            chosen_sources = []
-        if 'use_newsdata' not in locals():
-            use_newsdata = False
-        if 'newsdata_key' not in locals():
-            newsdata_key = ""
-        if not chosen_sources and not (use_newsdata and newsdata_key):
-            st.error("Pick at least one RSS source or enable Newsdata.io (see Configurations).")
-        else:
-            with st.spinner("Scanning sources, extracting content, and generating summaries..."):
-                rows = fetch_all(chosen_sources)
-                df = process_rows(rows)
-                ui_results(df, top_k)
+        with st.spinner("Scanning feeds and ranking relevant items…"):
+            rows = fetch_all(chosen_sources)
+            df = process_rows(rows)[:200]
+            ui_results(df)
     except Exception as e:
-        soft_fail("Something went wrong while assembling the results.", f"MAIN EXC {e}")
-        st.error("We ran into a hiccup assembling the results. Please try again or adjust your filters.")
+        soft_fail("Something went wrong building results.", f"MAIN EXC {e}")
+        st.error("We hit a hiccup assembling the results. Please tweak filters and try again.")
     finally:
         friendly_error_summary()
