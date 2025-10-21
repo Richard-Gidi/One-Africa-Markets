@@ -22,14 +22,17 @@ from requests.packages.urllib3.util.retry import Retry
 import xml.etree.ElementTree as ET
 import logging
 
-# ==== NEW: env loader ====
-from dotenv import load_dotenv
-load_dotenv()  # reads .env into process env
+# ==== resilient .env loader ====
+try:
+    from dotenv import load_dotenv  # pip install python-dotenv
+    load_dotenv()
+except Exception:
+    pass
 
-# ==== NEW: OpenAI client (safe import) ====
+# ==== OpenAI (lazy + resilient import) ====
 OPENAI_OK = True
 try:
-    from openai import OpenAI
+    from openai import OpenAI  # pip install openai==1.*
 except Exception:
     OPENAI_OK = False
 
@@ -158,10 +161,9 @@ IMPACT_RULES = {
     ],
 }
 
-# ========================= Streamlit UI CSS (TITLE COLOR FIX) =========================
+# ========================= Streamlit UI CSS =========================
 CARD_CSS = """
 <style>
-/* Hero header */
 .hero {
   position: relative;
   border-radius: 16px;
@@ -173,14 +175,12 @@ CARD_CSS = """
 .hero h1 { margin: 0 0 6px 0; font-size: 28px; font-weight: 800; }
 .hero p { margin: 0; opacity: .95; }
 
-/* Section title pill */
 .pill {
   display: inline-flex; align-items: center; gap: 8px;
   padding: 6px 12px; border-radius: 999px;
   background: rgba(255,255,255,0.15); color:#fff; font-weight:600; font-size: 13px;
 }
 
-/* Article cards */
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 16px; }
 .card {
   background: #ffffff;
@@ -200,26 +200,33 @@ CARD_CSS = """
 </style>
 """
 
-# ========================= Secrets helper (hide your API key) =========================
-def get_newsdata_api_key() -> str:
-    """Prefer Streamlit secrets, then environment variable. Never shows the key."""
+# ========================= Secrets helpers (no warnings) =========================
+def _get_secret_safely(name: str) -> str:
+    """
+    1) os.environ (works with .env via python-dotenv)
+    2) st.secrets[name] if Secrets are configured
+    Returns "" if missing, without triggering Streamlit's 'No secrets found' banner.
+    """
+    val = os.environ.get(name, "")
+    if val:
+        return str(val).strip().strip('"').strip("'")
     try:
-        key = st.secrets.get("NEWSDATA_API_KEY", "")
+        # If secrets exist, this will be a non-empty mapping
+        if hasattr(st, "secrets"):
+            try:
+                if len(st.secrets) > 0 and name in st.secrets:
+                    return str(st.secrets.get(name, "")).strip().strip('"').strip("'")
+            except Exception:
+                pass
     except Exception:
-        key = ""
-    if not key:
-        key = os.environ.get("NEWSDATA_API_KEY", "")
-    return key or ""
+        pass
+    return ""
+
+def get_newsdata_api_key() -> str:
+    return _get_secret_safely("NEWSDATA_API_KEY")
 
 def get_openai_api_key() -> str:
-    """Reads OPENAI_API_KEY only from env/secrets. Never displays it."""
-    try:
-        key = st.secrets.get("OPENAI_API_KEY", "")
-    except Exception:
-        key = ""
-    if not key:
-        key = os.environ.get("OPENAI_API_KEY", "")
-    return key or ""
+    return _get_secret_safely("OPENAI_API_KEY")
 
 # ========================= HTTP utils + safe wrappers =========================
 def get_session() -> requests.Session:
@@ -234,11 +241,9 @@ def _normalize(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-# Global bag to collect soft errors (shown as a friendly banner later)
+# Global soft error bag
 SOFT_ERRORS: List[str] = []
-
 def soft_fail(msg: str, detail: Optional[str] = None):
-    """Collect friendly error notes; log details to console only."""
     if msg:
         SOFT_ERRORS.append(msg)
     if detail:
@@ -290,7 +295,6 @@ def get_favicon_url(domain_url: str) -> str:
 
 @st.cache_data(ttl=60*30, show_spinner=False)
 def fetch_article_text_and_image(url: str) -> Tuple[str, str]:
-    """Returns (text, image_url). Never raises to UI."""
     if not url:
         return "", FALLBACK_IMG
     html_text = fetch_page(url)
@@ -517,13 +521,12 @@ def fetch_from_feed(url: str, start_date: dt.datetime, end_date: dt.datetime,
         })
     return items
 
-# ========================= Newsdata.io — secret-safe two-step =========================
+# ========================= Newsdata.io (optional) =========================
 NEWSDATA_BASE = "https://newsdata.io/api/1/latest"
 
 @st.cache_data(ttl=60*10, show_spinner=False)
 def fetch_from_newsdata_cached(redacted_params: Dict[str, Any], max_pages: int) -> List[Dict[str, Any]]:
-    """Cached by redacted params only (no API key inside cache)."""
-    return []  # stub — actual fetch happens in runtime wrapper
+    return []  # placeholder to keep cache signature consistent
 
 def fetch_from_newsdata_runtime(api_key: str, base_params: Dict[str, Any], max_pages: int) -> List[Dict[str, Any]]:
     session = get_session()
@@ -554,7 +557,6 @@ def fetch_from_newsdata_runtime(api_key: str, base_params: Dict[str, Any], max_p
         except Exception as e:
             soft_fail("Temporarily skipped an API page due to connectivity.", f"newsdata EXC {e}")
             break
-
     return items
 
 def fetch_from_newsdata(
@@ -569,15 +571,12 @@ def fetch_from_newsdata(
 ) -> List[Dict[str, Any]]:
     if not api_key:
         return []
-
-    # REDACTED params for cache identity (no key)
     redacted = {"q": query or ""}
     if language: redacted["language"] = language
     if country: redacted["country"] = country
     if category: redacted["category"] = category
 
-    _ = fetch_from_newsdata_cached(redacted, max_pages=max_pages)  # keep cache flow consistent
-
+    _ = fetch_from_newsdata_cached(redacted, max_pages=max_pages)
     items_raw = fetch_from_newsdata_runtime(api_key=api_key, base_params=redacted, max_pages=max_pages)
 
     items: List[Dict[str, Any]] = []
@@ -653,67 +652,118 @@ with act_b2:
         st.session_state.clear()
         st.rerun()
 
-# ======= CHAT ASSISTANT (always visible) =======
+# ======= CHAT ASSISTANT (resilient with fallbacks) =======
 st.markdown("### 🤖 Chat Assistant")
-st.caption("Ask follow-ups, draft digests, or generate summaries. Uses your `.env` OPENAI_API_KEY if available.")
+st.caption("Ask follow-ups, draft digests, or generate summaries. Uses your `.env`/Secrets OPENAI_API_KEY if available.")
 
 def init_chat_state():
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = [
             {"role": "system", "content": (
-                "You are a crisp market-intelligence assistant for West African tree crops (cashew, shea, cocoa, palm kernel). "
-                "Be concise, cite assumptions, and suggest actionable next steps. If asked to summarize a table, write bullet points."
+                "You are a crisp market-intelligence assistant for West African tree crops "
+                "(cashew, shea, cocoa, palm kernel). Be concise, cite assumptions, and suggest "
+                "actionable next steps. If asked to summarize a table, write bullet points."
             )}
         ]
-
 init_chat_state()
 
-# display history (omit system)
+def have_openai():
+    return OPENAI_OK and bool(get_openai_api_key())
+
+def get_openai_client():
+    try:
+        return OpenAI(api_key=get_openai_api_key())
+    except Exception as e:
+        logger.warning(f"OpenAI client init failed: {e}")
+        return None
+
+def generate_assistant_reply(messages, temperature: float = 0.4):
+    """
+    Try models in order; stream first, then non-stream fallback.
+    Return (text_or_None, streamed_bool). Never raises to UI.
+    """
+    if not have_openai():
+        return None, False
+    client = get_openai_client()
+    if client is None:
+        return None, False
+
+    model_candidates = [
+        "gpt-4o-mini",
+        "gpt-4o",
+        "gpt-4.1-mini",
+        "gpt-3.5-turbo-0125",
+    ]
+
+    last_err = None
+    for model in model_candidates:
+        # 1) streaming
+        try:
+            stream = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                stream=True,
+                temperature=temperature,
+            )
+            chunks = []
+            with st.chat_message("assistant"):
+                placeholder = st.empty()
+                buf = ""
+                for chunk in stream:
+                    delta = chunk.choices[0].delta.content or ""
+                    if delta:
+                        buf += delta
+                        placeholder.markdown(buf)
+                chunks.append(buf)
+            reply = "".join(chunks).strip()
+            if reply:
+                return reply, True
+        except Exception as e:
+            logger.warning(f"OpenAI streaming failed on {model}: {e}")
+            last_err = e
+
+        # 2) non-stream fallback
+        try:
+            comp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+            )
+            reply = (comp.choices[0].message.content or "").strip()
+            if reply:
+                return reply, False
+        except Exception as e2:
+            logger.warning(f"OpenAI non-streaming failed on {model}: {e2}")
+            last_err = e2
+            continue
+
+    soft_fail("Assistant is temporarily unavailable.", f"OpenAI failures: {last_err}")
+    return None, False
+
+# Render history (omit system)
 for m in st.session_state.chat_history:
     if m["role"] == "system":
         continue
     with st.chat_message(m["role"]):
         st.markdown(m["content"])
 
+# Chat input
 user_prompt = st.chat_input("Type your message...")
 if user_prompt:
-    # append user
     st.session_state.chat_history.append({"role": "user", "content": user_prompt})
     with st.chat_message("user"):
         st.markdown(user_prompt)
 
-    # respond
-    api_key = get_openai_api_key()
-    if not OPENAI_OK:
+    if not have_openai():
         with st.chat_message("assistant"):
-            st.warning("OpenAI SDK isn’t installed. Run `pip install openai==1.*`.")
-    elif not api_key:
-        with st.chat_message("assistant"):
-            st.warning("No `OPENAI_API_KEY` found in `.env` or Streamlit secrets. Please add it and rerun.")
+            st.warning("No `OPENAI_API_KEY` found (in `.env` or Streamlit Secrets). Add it and press **Reset**.")
     else:
-        try:
-            client = OpenAI(api_key=api_key)
-            # Stream the response
+        reply, _streamed = generate_assistant_reply(st.session_state.chat_history)
+        if reply:
+            st.session_state.chat_history.append({"role": "assistant", "content": reply})
+        else:
             with st.chat_message("assistant"):
-                placeholder = st.empty()
-                collected = ""
-                # Use a cost-efficient default; you can change to gpt-4o if you prefer.
-                stream = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=st.session_state.chat_history,
-                    stream=True,
-                    temperature=0.4,
-                )
-                for chunk in stream:
-                    delta = chunk.choices[0].delta.content or ""
-                    collected += delta
-                    placeholder.markdown(collected)
-                st.session_state.chat_history.append({"role": "assistant", "content": collected})
-        except Exception as e:
-            # Don’t leak error details to users
-            logger.warning(f"OpenAI chat error: {e}")
-            with st.chat_message("assistant"):
-                st.error("The assistant hit a temporary snag. Please try again.")
+                st.error("The assistant is temporarily unavailable. Please try again in a moment.")
 
 # ========================= SINGLE COLLAPSIBLE CONFIG PANEL =========================
 with st.sidebar:
@@ -747,7 +797,7 @@ with st.sidebar:
             if newsdata_key:
                 st.success("Using secured API key.")
             else:
-                st.warning("No API key found. Add NEWSDATA_API_KEY to `.env` or Streamlit secrets, or use a temporary override.")
+                st.warning("No API key found. Add NEWSDATA_API_KEY to `.env`/Secrets, or use a temporary override.")
 
         newsdata_query = st.text_input("Query", value="tree crop commodities", key="nd_query")
         c1, c2, c3 = st.columns(3)
@@ -970,7 +1020,6 @@ def ui_results(df: pd.DataFrame, top_k: int):
     st.info("💡 Tip: Paste the Markdown into an email, WhatsApp (as a code block), or your wiki for quick sharing.")
 
 def friendly_error_summary():
-    """Show a compact, friendly banner summarizing soft issues (no stack traces)."""
     if not SOFT_ERRORS:
         return
     counts: Dict[str,int] = {}
