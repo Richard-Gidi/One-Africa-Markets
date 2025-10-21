@@ -1,6 +1,5 @@
 # OneAfrica Market Pulse — Automated Market Intelligence (Streamlit Demo)
 # Author: Richard Gidi
-# Focus: Robust news-only pipeline (RSS/Atom + optional Newsdata.io) with premium UI and friendly error handling.
 # Run: streamlit run streamlit_app.py
 
 import os
@@ -45,7 +44,7 @@ except Exception:
     logger.info("sklearn not available; falling back to keyword hit scoring.")
 
 # ========================= App Strings / Theme =========================
-APP_NAME = "OneAfrica Market Pulse"
+APP_NAME = "One Africa Market Pulse"
 TAGLINE = "Automated intelligence for cashew, shea, cocoa & allied markets."
 QUOTE = "“Ask your data why, until it has nothing else to say.” — Richard Gidi"
 
@@ -148,7 +147,7 @@ IMPACT_RULES = {
     ],
 }
 
-# ========================= Streamlit UI CSS =========================
+# ========================= Streamlit UI CSS (TITLE COLOR FIX) =========================
 CARD_CSS = """
 <style>
 /* Hero header */
@@ -171,11 +170,9 @@ CARD_CSS = """
 }
 
 /* Article cards */
-.grid {
-  display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 16px;
-}
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 16px; }
 .card {
-  background: var(--card-bg, #ffffff);
+  background: #ffffff; /* force white so text colors below always contrast */
   border: 1px solid rgba(0,0,0,.06);
   border-radius: 14px; overflow: hidden;
   transition: transform .15s ease, box-shadow .15s ease;
@@ -183,15 +180,23 @@ CARD_CSS = """
 .card:hover { transform: translateY(-3px); box-shadow: 0 10px 24px rgba(0,0,0,0.08); }
 .thumb { width: 100%; height: 180px; object-fit: cover; background:#f6f7f9; }
 .card-body { padding: 14px; }
-.title { font-weight: 700; font-size: 16px; margin: 4px 0 8px 0; line-height: 1.25; }
-.meta { font-size: 12px; color: #6b7280; display:flex; gap:10px; flex-wrap:wrap; margin-bottom:8px; }
+
+/* FORCE readable colors regardless of Streamlit theme */
+.card .title {
+  color: #111827 !important;  /* slate-900 */
+  font-weight: 800;
+  font-size: 18px;
+  margin: 6px 0 8px 0;
+  line-height: 1.25;
+}
+.card .meta { color: #6b7280 !important; font-size: 12px; display:flex; gap:10px; flex-wrap:wrap; margin-bottom:8px; }
+.card .summary { color:#374151 !important; font-size: 13px; line-height:1.55; margin-top: 6px; }
 .badges { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0; }
 .badge {
   font-size: 11px; font-weight:700; padding:4px 8px; border-radius:999px;
   background:#eef2ff; color:#3730a3; border:1px solid #c7d2fe;
 }
-.summary { font-size: 13px; color:#374151; line-height:1.5; margin-top: 6px;}
-.link { text-decoration: none; font-weight:700; color:#2563eb; }
+.link { text-decoration: none; font-weight:700; color:#2563eb !important; }
 </style>
 """
 
@@ -507,20 +512,10 @@ NEWSDATA_BASE = "https://newsdata.io/api/1/latest"
 
 @st.cache_data(ttl=60*10, show_spinner=False)
 def fetch_from_newsdata_cached(redacted_params: Dict[str, Any], max_pages: int) -> List[Dict[str, Any]]:
-    """
-    Cached by *redacted* params only (no API key inside cache).
-    We do not perform network calls here to avoid storing secrets in cache.
-    """
+    """Cached by redacted params only (no API key inside cache)."""
     return []  # stub — actual fetch happens in runtime wrapper
 
-def fetch_from_newsdata_runtime(
-    api_key: str,
-    base_params: Dict[str, Any],
-    max_pages: int
-) -> List[Dict[str, Any]]:
-    """
-    Real network calls happen here with the API key in-memory only.
-    """
+def fetch_from_newsdata_runtime(api_key: str, base_params: Dict[str, Any], max_pages: int) -> List[Dict[str, Any]]:
     session = get_session()
     items: List[Dict[str, Any]] = []
     pages = 0
@@ -571,10 +566,8 @@ def fetch_from_newsdata(
     if country: redacted["country"] = country
     if category: redacted["category"] = category
 
-    # Call stub cache (keeps cache flow consistent without storing secrets)
-    _ = fetch_from_newsdata_cached(redacted, max_pages=max_pages)
+    _ = fetch_from_newsdata_cached(redacted, max_pages=max_pages)  # keep cache flow consistent
 
-    # Then do the real fetch runtime with the key
     items_raw = fetch_from_newsdata_runtime(api_key=api_key, base_params=redacted, max_pages=max_pages)
 
     items: List[Dict[str, Any]] = []
@@ -671,10 +664,8 @@ with st.sidebar:
         if override:
             tmp_key = st.text_input("Enter API key", type="password", key="nd_key_input")
 
-        # Decide which key to use at runtime (override > secrets/env)
         newsdata_key = (tmp_key or auto_key).strip()
 
-        # Subtle status line (no key shown)
         if use_newsdata:
             if newsdata_key:
                 st.success("Using secured API key.")
