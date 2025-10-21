@@ -1,29 +1,28 @@
 # OneAfrica Market Pulse — Automated Market Intelligence (Streamlit Demo)
 # Author: Richard Gidi
-# Focus: News-only, RSS/Atom parsing without 'feedparser', optional Newsdata.io API, robust validation, and friendly fallbacks.
+# Focus: Robust news-only pipeline (RSS/Atom + optional Newsdata.io) with premium UI.
 # Run: streamlit run streamlit_app.py
 
-import os
 import re
 import html
-import json
+import hashlib
 import datetime as dt
-import logging
 from typing import List, Dict, Tuple, Optional, Any
 from functools import lru_cache
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, urljoin
 
-import pandas as pd
 import numpy as np
-import streamlit as st
+import pandas as pd
 import requests
+import streamlit as st
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 import xml.etree.ElementTree as ET
 
-# --------------------- Optional sklearn (graceful fallback) ---------------------
+# ========================= Optional sklearn (graceful fallback) =========================
 HAS_SK = True
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
@@ -31,14 +30,13 @@ try:
 except Exception:
     HAS_SK = False
 
-# --------------------- Logging ---------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("oneafrica.pulse")
-
-# --------------------- App strings ---------------------
-APP_NAME = "One Africa Market Pulse"
+# ========================= App Strings / Theme =========================
+APP_NAME = "OneAfrica Market Pulse"
 TAGLINE = "Automated intelligence for cashew, shea, cocoa & allied markets."
 QUOTE = "“Ask your data why, until it has nothing else to say.” — Richard Gidi"
+
+# Fallback image for articles with no thumbnail
+FALLBACK_IMG = "https://images.unsplash.com/photo-1519681393784-d120267933ba?q=80&w=1200&auto=format&fit=crop"
 
 DEFAULT_KEYWORDS = [
     "cashew", "shea", "shea nut", "cocoa", "palm kernel", "agri", "export", "harvest",
@@ -48,33 +46,18 @@ DEFAULT_KEYWORDS = [
     "west africa", "sahel", "trade policy", "commodity", "price", "market"
 ]
 
-# --------------------- Curated working feeds (no feedparser needed) ---------------------
+# Curated working RSS/Atom sources
 DEFAULT_SOURCES = {
-    # AllAfrica official categories
     "AllAfrica » Agriculture": "https://allafrica.com/tools/headlines/rdf/agriculture/headlines.rdf",
     "AllAfrica » Business": "https://allafrica.com/tools/headlines/rdf/business/headlines.rdf",
-
-    # Kenya — The Standard (section RSS)
     "The Standard » Business": "https://www.standardmedia.co.ke/rss/business.php",
     "The Standard » Agriculture": "https://www.standardmedia.co.ke/rss/agriculture.php",
-
-    # Ghana — Citi Newsroom
     "CitiNewsroom": "https://citinewsroom.com/feed/",
-
-    # FAO — official feeds
     "FAO News (All topics)": "https://www.fao.org/news/rss/en",
     "FAO GIEWS": "https://www.fao.org/giews/rss/en/",
-
-    # Fresh produce / agri trade (Africa channel)
     "FreshPlaza Africa": "https://www.freshplaza.com/africa/rss.xml",
-
-    # African Arguments
     "African Arguments": "https://africanarguments.org/feed/",
-
-    # How We Made It In Africa (business stories)
     "How We Made It In Africa": "https://www.howwemadeitinafrica.com/feed/",
-
-    # Bizcommunity – generated: agriculture (63) + logistics (76), region Africa
     "Bizcommunity (Africa • Agri+Logistics)": "https://www.bizcommunity.com/GenerateRss.aspx?i=63,76&c=81",
 }
 
@@ -89,7 +72,7 @@ IMPACT_RULES = {
         r"\b(?:strike|protest|unrest)\b",
         r"\bport (?:closure|congestion|delay)\b",
         r"\bharvest (?:delay|loss|damage)\b",
-        r"\bproduction (?:issue|problem|concern)\b"
+        r"\bproduction (?:issue|problem|concern)\b",
     ],
     "Price Upside": [
         r"\bstrong (?:demand|buying|interest)\b",
@@ -100,7 +83,7 @@ IMPACT_RULES = {
         r"\bhigh(?:er)? (?:price|demand|consumption)\b",
         r"\bmarket (?:rally|strength|upturn)\b",
         r"\bsupply (?:squeeze|shortage|tightness)\b",
-        r"\bquality premium\b"
+        r"\bquality premium\b",
     ],
     "Price Downside": [
         r"\b(?:oversupply|surplus|glut)\b",
@@ -109,7 +92,7 @@ IMPACT_RULES = {
         r"\bcut (?:price|rate|cost)\b",
         r"\blow(?:er)? (?:price|demand|consumption)\b",
         r"\bmarket (?:weakness|downturn)\b",
-        r"\bcompetitive pressure\b"
+        r"\bcompetitive pressure\b",
     ],
     "FX & Policy": [
         r"\b(?:depreciation|devaluation)\b",
@@ -119,7 +102,7 @@ IMPACT_RULES = {
         r"\b(?:interest|exchange) rate\b",
         r"\b(?:tariff|duty|levy|tax)\b",
         r"\bregulatory (?:change|update|requirement)\b",
-        r"\bpolicy (?:change|update|reform)\b"
+        r"\bpolicy (?:change|update|reform)\b",
     ],
     "Logistics & Trade": [
         r"\b(?:freight|shipping|transport)\b",
@@ -128,7 +111,7 @@ IMPACT_RULES = {
         r"\b(?:reroute|divert|alternative route)\b",
         r"\b(?:cost|rate) (?:increase|surge|rise)\b",
         r"\btrade (?:flow|route|pattern)\b",
-        r"\b(?:export|import) (?:volume|data|figure)\b"
+        r"\b(?:export|import) (?:volume|data|figure)\b",
     ],
     "Market Structure": [
         r"\b(?:merger|acquisition|takeover)\b",
@@ -138,7 +121,7 @@ IMPACT_RULES = {
         r"\b(?:cooperative|association|group)\b",
         r"\b(?:contract|agreement|deal)\b",
         r"\b(?:partnership|collaboration)\b",
-        r"\bmarket (?:structure|reform|development)\b"
+        r"\bmarket (?:structure|reform|development)\b",
     ],
     "Tech & Innovation": [
         r"\b(?:technology|innovation|digital)\b",
@@ -147,11 +130,11 @@ IMPACT_RULES = {
         r"\b(?:efficiency|optimization)\b",
         r"\b(?:automation|mechanization)\b",
         r"\b(?:research|development|r&d)\b",
-        r"\b(?:startup|fintech|agtech)\b"
-    ]
+        r"\b(?:startup|fintech|agtech)\b",
+    ],
 }
 
-# --------------------- HTTP utils ---------------------
+# ========================= HTTP utils =========================
 def get_session() -> requests.Session:
     session = requests.Session()
     retries = Retry(total=3, backoff_factor=0.6, status_forcelist=[429, 500, 502, 503, 504])
@@ -164,28 +147,63 @@ def _normalize(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-@lru_cache(maxsize=100)
-def fetch_article_text(url: str, timeout: int = 12) -> str:
+# ========================= Content helpers =========================
+@st.cache_data(ttl=60*30, show_spinner=False)  # cache 30 minutes
+def fetch_page(url: str, timeout: int = 12) -> str:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; OneAfricaPulse/1.0)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
+    r = get_session().get(url, headers=headers, timeout=timeout)
+    r.raise_for_status()
+    return r.text
+
+def get_og_image(soup: BeautifulSoup, base_url: str) -> Optional[str]:
+    # Common OG/meta image selectors
+    candidates = [
+        ("meta", {"property": "og:image"}),
+        ("meta", {"name": "twitter:image"}),
+        ("meta", {"property": "twitter:image"}),
+        ("link", {"rel": "image_src"}),
+    ]
+    for tag, attrs in candidates:
+        el = soup.find(tag, attrs=attrs)
+        if el:
+            src = el.get("content") or el.get("href")
+            if src:
+                if src.startswith("//"):
+                    return "https:" + src
+                if src.startswith("/"):
+                    return urljoin(base_url, src)
+                return src
+    return None
+
+def get_favicon_url(domain_url: str) -> str:
+    # basic favicon fallback
+    parsed = urlparse(domain_url)
+    return f"{parsed.scheme}://{parsed.netloc}/favicon.ico"
+
+@st.cache_data(ttl=60*30, show_spinner=False)
+def fetch_article_text_and_image(url: str) -> Tuple[str, str]:
+    """
+    Returns (text, image_url). Fetches OG image if present; falls back to favicon or stock.
+    """
     if not url:
-        return ""
+        return "", FALLBACK_IMG
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; OneAfricaPulse/1.0)",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-        }
-        session = get_session()
-        r = session.get(url, headers=headers, timeout=timeout)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
+        html_text = fetch_page(url)
+        soup = BeautifulSoup(html_text, "html.parser")
         for tag in soup(["script", "style", "noscript", "nav", "footer", "iframe", "form"]):
             tag.decompose()
+
+        # Extract body text (greedy but robust)
         candidates = []
         selectors = [
             "article", "[role='main']", ".article-body", ".story-body",
             ".post-content", "main", ".content", ".entry-content",
             "#article-body", ".article-content", ".story-content",
-            ".news-content", ".page-content", "body"
+            ".news-content", ".page-content", "body",
         ]
         for sel in selectors:
             for node in soup.select(sel):
@@ -194,26 +212,31 @@ def fetch_article_text(url: str, timeout: int = 12) -> str:
                     candidates.append(text)
         text = max(candidates, key=len) if candidates else soup.get_text(separator=" ", strip=True)
         text = _normalize(text)
-        return text if len(text) >= 50 else ""
-    except Exception as e:
-        logger.warning(f"Article fetch failed: {url} ({e})")
-        return ""
+        if len(text) < 50:
+            text = ""
 
-# --------------------- Relevance & Summary ---------------------
+        # Try image
+        img = get_og_image(soup, url)
+        if not img:
+            # fallback: site favicon
+            parsed = urlparse(url)
+            img = get_favicon_url(f"{parsed.scheme}://{parsed.netloc}")
+        return text, (img or FALLBACK_IMG)
+    except Exception:
+        return "", FALLBACK_IMG
+
+# ========================= Relevance & Summary =========================
 def keyword_relevance(text: str, keywords: List[str]) -> float:
     if not text:
         return 0.0
     if HAS_SK:
         try:
-            corpus = [text]
-            query = " ".join(keywords)
             vec = TfidfVectorizer(stop_words="english", max_features=5000)
-            X = vec.fit_transform(corpus + [query])
-            sim = cosine_similarity(X[0:1], X[-1])[0][0]
+            X = vec.fit_transform([text, " ".join(keywords)])
+            sim = cosine_similarity(X[0:1], X[1:2])[0][0]
             return float(sim)
         except Exception:
             pass
-    # fallback: simple ratio of keyword hits
     tokens = re.findall(r"[a-zA-Z']{3,}", text.lower())
     kwset = {k.lower() for k in keywords}
     hits = sum(1 for t in tokens if t in kwset)
@@ -231,15 +254,13 @@ def simple_extractive_summary(text: str, n_sentences: int = 3, keywords: Optiona
             vec = TfidfVectorizer(stop_words="english", max_features=8000)
             X = vec.fit_transform(sents)
             centroid = X.mean(axis=0)
-            sims = cosine_similarity(X, centroid)
-            sims = np.array(sims).ravel()
+            sims = cosine_similarity(X, centroid).ravel()
             if keywords:
                 kw = [k.lower() for k in keywords]
                 boost = np.array([sum(1 for w in re.findall(r"[a-z']+", s.lower()) if w in kw) for s in sents], dtype=float)
                 sims = sims + 0.05 * boost
             idx = sims.argsort()[-n_sentences:][::-1]
-            chosen = [sents[i] for i in idx]
-            return " ".join(chosen)
+            return " ".join([sents[i] for i in idx])
         except Exception:
             pass
     return " ".join(sents[:n_sentences])
@@ -248,13 +269,9 @@ def classify_impact(text: str) -> List[str]:
     tags = []
     lower = text.lower()
     for label, patterns in IMPACT_RULES.items():
-        for p in patterns:
-            if re.search(p, lower):
-                tags.append(label)
-                break
-    if not tags:
-        tags = ["General"]
-    return list(dict.fromkeys(tags))
+        if any(re.search(p, lower) for p in patterns):
+            tags.append(label)
+    return list(dict.fromkeys(tags)) or ["General"]
 
 def parse_date(date_str: str) -> Optional[dt.datetime]:
     try:
@@ -273,7 +290,7 @@ def parse_date(date_str: str) -> Optional[dt.datetime]:
     except Exception:
         return None
 
-# --------------------- RSS/Atom parser (no feedparser) ---------------------
+# ========================= RSS/Atom parsing (no feedparser) =========================
 ATOM_NS = "{http://www.w3.org/2005/Atom}"
 
 def _text(elem: Optional[ET.Element]) -> str:
@@ -290,16 +307,25 @@ def _find(elem: ET.Element, tag: str) -> Optional[ET.Element]:
 def _findall(elem: ET.Element, tag: str) -> List[ET.Element]:
     return list(elem.findall(tag)) + list(elem.findall(ATOM_NS + tag))
 
+@st.cache_data(ttl=60*10, show_spinner=False)  # cache feeds 10 min
+def fetch_feed_raw(url: str, timeout: int = 20) -> bytes:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0 OneAfricaPulse/1.0",
+        "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
+    }
+    r = get_session().get(url, headers=headers, timeout=timeout, allow_redirects=True)
+    return r.content if r.status_code == 200 else (r.content or b"")
+
 def parse_feed_xml(content: bytes, base_url: str) -> List[Dict[str, str]]:
     items: List[Dict[str, str]] = []
+    if not content:
+        return items
     try:
         root = ET.fromstring(content)
-
-        # RSS: <channel><item>...
         channel = root.find("channel")
-        if channel is not None:
+        if channel is not None:  # RSS
             for it in channel.findall("item"):
-                title = _text(_find(it, "title"))
+                title = _text(_find(it, "title")) or "(untitled)"
                 link = _text(_find(it, "link"))
                 if not link:
                     guid = _find(it, "guid")
@@ -308,19 +334,13 @@ def parse_feed_xml(content: bytes, base_url: str) -> List[Dict[str, str]]:
                     link = urljoin(base_url, link)
                 summary = _text(_find(it, "description"))
                 pub = _text(_find(it, "pubDate"))
-                if not title and not link:
-                    continue
-                items.append({
-                    "title": title or "(untitled)",
-                    "link": link,
-                    "summary": summary,
-                    "published_raw": pub
-                })
+                if title or link:
+                    items.append({"title": title, "link": link, "summary": summary, "published_raw": pub})
             return items
 
-        # Atom: <entry>...
+        # Atom
         for entry in _findall(root, "entry"):
-            title = _text(_find(entry, "title"))
+            title = _text(_find(entry, "title")) or "(untitled)"
             link_el = _find(entry, "link")
             link = ""
             if link_el is not None:
@@ -329,54 +349,92 @@ def parse_feed_xml(content: bytes, base_url: str) -> List[Dict[str, str]]:
                 link = urljoin(base_url, link)
             summary = _text(_find(entry, "summary")) or _text(_find(entry, "content"))
             pub = _text(_find(entry, "updated")) or _text(_find(entry, "published"))
-            if not title and not link:
-                continue
-            items.append({
-                "title": title or "(untitled)",
-                "link": link,
-                "summary": summary,
-                "published_raw": pub
-            })
+            if title or link:
+                items.append({"title": title, "link": link, "summary": summary, "published_raw": pub})
         return items
-    except Exception as e:
-        logger.error(f"XML parse error: {e}")
+    except Exception:
         return items
 
 def validate_feed(url: str, ignore_recency_check: bool = False) -> Tuple[bool, str]:
-    """Lenient validation using requests + our XML parser."""
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0 OneAfricaPulse/1.0",
-            "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*"
-        }
-        session = get_session()
-        r = session.get(url, headers=headers, timeout=20, allow_redirects=True)
-        content = r.content if r.status_code == 200 else (r.content or b"")
+        content = fetch_feed_raw(url)
         items = parse_feed_xml(content, base_url=url)
         if not items:
             return False, "No entries found"
-
-        if not ignore_recency_check:
-            now = dt.datetime.now(dt.timezone.utc)
-            recent = False
-            for it in items[:10]:
-                d = parse_date(it.get("published_raw", "") or "")
-                if d:
-                    if d.tzinfo:
-                        d = d.astimezone(dt.timezone.utc)
-                    else:
-                        d = d.replace(tzinfo=dt.timezone.utc)
-                    if (now - d).days <= 60:  # relaxed window
-                        recent = True
-                        break
-            if not recent:
-                return False, "No recent entries (≤60 days)"
-        return True, "OK"
+        if ignore_recency_check:
+            return True, "OK"
+        now = dt.datetime.now(dt.timezone.utc)
+        for it in items[:10]:
+            d = parse_date(it.get("published_raw", "") or "")
+            if d:
+                d = d.astimezone(dt.timezone.utc) if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
+                if (now - d).days <= 60:
+                    return True, "OK"
+        return False, "No recent entries (≤60 days)"
     except Exception as ex:
         return False, f"Validation error: {ex}"
 
-# --------------------- Newsdata.io integration ---------------------
+def fetch_from_feed(url: str, start_date: dt.datetime, end_date: dt.datetime,
+                    force_fetch: bool, ignore_recency: bool) -> List[Dict[str, Any]]:
+    ok, status = validate_feed(url, ignore_recency_check=ignore_recency)
+    if not ok and not force_fetch:
+        st.warning(f"⚠️ Failed to validate feed {urlparse(url).netloc}: {status}")
+        return []
+    elif not ok and force_fetch:
+        st.warning(f"⚠️ Validation failed for {urlparse(url).netloc} ({status}). Forcing fetch...")
+
+    raw = fetch_feed_raw(url)
+    raw_items = parse_feed_xml(raw, base_url=url)
+
+    items: List[Dict[str, Any]] = []
+    for e in raw_items:
+        title = _normalize(e.get("title", ""))
+        link = e.get("link", "")
+        summary = _normalize(e.get("summary", ""))
+        published = None
+        if e.get("published_raw"):
+            published = parse_date(e["published_raw"])
+        if published:
+            published = published.astimezone(dt.timezone.utc) if published.tzinfo else published.replace(tzinfo=dt.timezone.utc)
+            if not (start_date <= published <= end_date):
+                continue
+            published_str = published.strftime("%Y-%m-%d %H:%M UTC")
+        else:
+            published_str = "Date unknown"
+        items.append({
+            "source": urlparse(url).netloc,
+            "title": title,
+            "link": link,
+            "published": published_str,
+            "summary": summary,
+        })
+    return items
+
+# ========================= Newsdata.io =========================
 NEWSDATA_BASE = "https://newsdata.io/api/1/latest"
+
+@st.cache_data(ttl=60*10, show_spinner=False)
+def fetch_from_newsdata_cached(params: Dict[str, Any], max_pages: int) -> List[Dict[str, Any]]:
+    session = get_session()
+    items: List[Dict[str, Any]] = []
+    pages = 0
+    next_page = None
+    while pages < max_pages:
+        q = dict(params)
+        if next_page:
+            q["page"] = next_page
+        r = session.get(NEWSDATA_BASE, params=q, timeout=20)
+        if r.status_code != 200:
+            break
+        data = r.json()
+        results = data.get("results") or data.get("articles") or []
+        for a in results:
+            items.append(a)
+        next_page = data.get("nextPage") or data.get("next_page")
+        pages += 1
+        if not next_page:
+            break
+    return items
 
 def fetch_from_newsdata(
     api_key: str,
@@ -388,126 +446,87 @@ def fetch_from_newsdata(
     category: Optional[str] = None,
     max_pages: int = 2,
 ) -> List[Dict[str, Any]]:
-    """
-    Fetch items from Newsdata.io and map to our common schema.
-    Uses incremental pagination with 'nextPage'.
-    """
     if not api_key:
         return []
-    params = {
-        "apikey": api_key,
-        "q": query or "",
-    }
-    # Newsdata latest endpoint supports filters like language, country, category (depending on plan).
+    params = {"apikey": api_key, "q": query or ""}
     if language: params["language"] = language
     if country: params["country"] = country
     if category: params["category"] = category
 
+    items_raw = fetch_from_newsdata_cached(params, max_pages=max_pages)
     items: List[Dict[str, Any]] = []
-    session = get_session()
-    next_page = None
-    pages = 0
+    for a in items_raw:
+        title = _normalize(a.get("title", ""))
+        link = a.get("link") or a.get("url") or ""
+        source = a.get("source_id") or a.get("source") or "newsdata.io"
+        pub = a.get("pubDate") or a.get("published_at") or ""
+        desc = _normalize(a.get("description", "")) or _normalize(a.get("content", ""))
 
-    while pages < max_pages:
-        try:
-            local_params = dict(params)
-            if next_page:
-                local_params["page"] = next_page
-            r = session.get(NEWSDATA_BASE, params=local_params, timeout=20)
-            r.raise_for_status()
-            data = r.json()
-
-            results = data.get("results") or data.get("articles") or []
-            for a in results:
-                title = _normalize(a.get("title", ""))
-                link = a.get("link") or a.get("url") or ""
-                source = a.get("source_id") or a.get("source") or "newsdata.io"
-                pub = a.get("pubDate") or a.get("published_at") or ""
-                desc = _normalize(a.get("description", "")) or _normalize(a.get("content", ""))
-
-                # date filter
-                published_str = "Date unknown"
-                ok_date = True
-                if pub:
-                    d = parse_date(pub)
-                    if d:
-                        if d.tzinfo:
-                            d = d.astimezone(dt.timezone.utc)
-                        else:
-                            d = d.replace(tzinfo=dt.timezone.utc)
-                        ok_date = start_date <= d <= end_date
-                        published_str = d.strftime("%Y-%m-%d %H:%M UTC")
-                if not ok_date:
-                    continue
-
-                items.append({
-                    "source": f"{source} (newsdata.io)",
-                    "title": title or "(untitled)",
-                    "link": link,
-                    "published": published_str,
-                    "summary": desc
-                })
-
-            next_page = data.get("nextPage") or data.get("next_page")
-            pages += 1
-            if not next_page:
-                break
-        except Exception as e:
-            logger.warning(f"Newsdata fetch warning: {e}")
-            break
-    return items
-
-# --------------------- Fetch from RSS/Atom ---------------------
-def fetch_from_feed(url: str, start_date: dt.datetime, end_date: dt.datetime,
-                    force_fetch: bool, ignore_recency: bool) -> List[Dict[str, Any]]:
-    logger.info(f"Fetching feed from: {url}")
-
-    ok, status = validate_feed(url, ignore_recency_check=ignore_recency)
-    if not ok and not force_fetch:
-        st.warning(f"⚠️ Failed to validate feed {urlparse(url).netloc}: {status}")
-        return []
-    elif not ok and force_fetch:
-        st.warning(f"⚠️ Validation failed for {urlparse(url).netloc} ({status}). Forcing fetch...")
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; OneAfricaPulse/1.0)",
-        "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml"
-    }
-    session = get_session()
-    r = session.get(url, headers=headers, timeout=20)
-    content = r.content if r.status_code == 200 else b""
-    raw_items = parse_feed_xml(content, base_url=url)
-
-    items: List[Dict[str, Any]] = []
-    for e in raw_items:
-        title = _normalize(e.get("title", ""))
-        link = e.get("link", "")
-        summary = _normalize(e.get("summary", ""))
-        published = None
-
-        if e.get("published_raw"):
-            published = parse_date(e["published_raw"])
-
-        if published:
-            if published.tzinfo:
-                published = published.astimezone(dt.timezone.utc)
-            else:
-                published = published.replace(tzinfo=dt.timezone.utc)
-            if not (start_date <= published <= end_date):
-                continue
-            published_str = published.strftime("%Y-%m-%d %H:%M UTC")
-        else:
-            published_str = "Date unknown"
-
+        ok_date = True
+        published_str = "Date unknown"
+        if pub:
+            d = parse_date(pub)
+            if d:
+                d = d.astimezone(dt.timezone.utc) if d.tzinfo else d.replace(tzinfo=dt.timezone.utc)
+                ok_date = start_date <= d <= end_date
+                published_str = d.strftime("%Y-%m-%d %H:%M UTC")
+        if not ok_date:
+            continue
         items.append({
-            "source": urlparse(url).netloc,
-            "title": title,
+            "source": f"{source} (newsdata.io)",
+            "title": title or "(untitled)",
             "link": link,
             "published": published_str,
-            "summary": summary
+            "summary": desc,
         })
-    logger.info(f"Found {len(items)} date-filtered entries in feed {url}")
     return items
+
+# ========================= UI Helpers =========================
+CARD_CSS = """
+<style>
+/* Hero header */
+.hero {
+  position: relative;
+  border-radius: 16px;
+  padding: 28px 28px;
+  background: linear-gradient(135deg, #0ea5e9, #7c3aed 60%);
+  color: white;
+  box-shadow: 0 14px 40px rgba(0,0,0,0.18);
+}
+.hero h1 { margin: 0 0 6px 0; font-size: 28px; font-weight: 800; }
+.hero p { margin: 0; opacity: .95; }
+
+/* Section title pill */
+.pill {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 6px 12px; border-radius: 999px;
+  background: rgba(255,255,255,0.15); color:#fff; font-weight:600; font-size: 13px;
+}
+
+/* Article cards */
+.grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 16px;
+}
+.card {
+  background: var(--card-bg, #ffffff);
+  border: 1px solid rgba(0,0,0,.06);
+  border-radius: 14px; overflow: hidden;
+  transition: transform .15s ease, box-shadow .15s ease;
+}
+.card:hover { transform: translateY(-3px); box-shadow: 0 10px 24px rgba(0,0,0,0.08); }
+.thumb { width: 100%; height: 180px; object-fit: cover; background:#f6f7f9; }
+.card-body { padding: 14px; }
+.title { font-weight: 700; font-size: 16px; margin: 4px 0 8px 0; line-height: 1.25; }
+.meta { font-size: 12px; color: #6b7280; display:flex; gap:10px; flex-wrap:wrap; margin-bottom:8px; }
+.badges { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0; }
+.badge {
+  font-size: 11px; font-weight:700; padding:4px 8px; border-radius:999px;
+  background:#eef2ff; color:#3730a3; border:1px solid #c7d2fe;
+}
+.summary { font-size: 13px; color:#374151; line-height:1.5; margin-top: 6px;}
+.link { text-decoration: none; font-weight:700; color:#2563eb; }
+</style>
+"""
 
 def make_digest(df: pd.DataFrame, top_k: int = 12) -> str:
     header = f"# {APP_NAME} — Daily Digest\n\n*{TAGLINE}*\n\n> {QUOTE}\n\n"
@@ -515,304 +534,283 @@ def make_digest(df: pd.DataFrame, top_k: int = 12) -> str:
         return header + "_No relevant items found for the selected period._"
     parts = [header, f"**Date:** {dt.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"]
     for _, row in df.head(top_k).iterrows():
+        impact = ", ".join(row["impact"])
         parts.append(
             f"### {row['title']}\n"
             f"- **Source:** {row['source']}  \n"
             f"- **Published:** {row['published']}  \n"
             f"- **Relevance:** {row['relevance']:.3f}  \n"
-            f"- **Impact:** {', '.join(row['impact'])}  \n"
+            f"- **Impact:** {impact}  \n"
             f"- **Summary:** {row['auto_summary']}\n"
             f"[Read more]({row['link']})\n\n---\n"
         )
     return "\n".join(parts)
 
-# --------------------- Streamlit UI ---------------------
+# ========================= Streamlit Layout =========================
 st.set_page_config(page_title=APP_NAME, page_icon="🌍", layout="wide", initial_sidebar_state="expanded")
+st.markdown(CARD_CSS, unsafe_allow_html=True)
 
-st.title("🌍 One Africa Market Pulse")
-st.caption(TAGLINE)
-st.markdown(f"<blockquote style='font-style: italic; margin: 1em 0;'>{QUOTE}</blockquote>", unsafe_allow_html=True)
+with st.container():
+    st.markdown(f"""
+    <div class="hero">
+        <div class="pill">🌍 OneAfrica Market Pulse</div>
+        <h1>{TAGLINE}</h1>
+        <p>{QUOTE}</p>
+    </div>
+    """, unsafe_allow_html=True)
 
 with st.sidebar:
     st.header("⚙️ Configuration")
 
-    with st.expander("📰 News Sources (RSS/Atom)", expanded=True):
-        st.markdown("Select the sources to scan for market intelligence:")
-
+    # News sources
+    with st.expander("📰 RSS/Atom Sources", expanded=True):
         chosen_sources: List[str] = []
-        categories = {
-            "AllAfrica (official)": [("AllAfrica » Agriculture", DEFAULT_SOURCES["AllAfrica » Agriculture"]),
-                                     ("AllAfrica » Business", DEFAULT_SOURCES["AllAfrica » Business"])],
-            "National & Regional": [("The Standard » Business", DEFAULT_SOURCES["The Standard » Business"]),
-                                    ("The Standard » Agriculture", DEFAULT_SOURCES["The Standard » Agriculture"]),
-                                    ("CitiNewsroom", DEFAULT_SOURCES["CitiNewsroom"])],
-            "Multilateral & Trade": [("FAO News (All topics)", DEFAULT_SOURCES["FAO News (All topics)"]),
-                                     ("FAO GIEWS", DEFAULT_SOURCES["FAO GIEWS"])],
-            "Agri/Logistics Trade Press": [("FreshPlaza Africa", DEFAULT_SOURCES["FreshPlaza Africa"]),
-                                           ("Bizcommunity (Africa • Agri+Logistics)", DEFAULT_SOURCES["Bizcommunity (Africa • Agri+Logistics)"])],
-            "Analysis & Features": [("African Arguments", DEFAULT_SOURCES["African Arguments"]),
-                                    ("How We Made It In Africa", DEFAULT_SOURCES["How We Made It In Africa"])],
-        }
-
-        for category, sources in categories.items():
-            st.markdown(f"#### {category}")
-            for name, url in sources:
-                if st.checkbox(name, value=True):
-                    chosen_sources.append(url)
-            st.markdown("---")
-
-        if st.button("🔄 Check Feed Status"):
-            st.markdown("### Feed Status Check")
+        for name, url in DEFAULT_SOURCES.items():
+            if st.checkbox(name, value=True):
+                chosen_sources.append(url)
+        if st.button("🔄 Check Feeds"):
             for name, url in DEFAULT_SOURCES.items():
                 ok, status = validate_feed(url, ignore_recency_check=True)
-                if ok:
-                    st.success(f"✅ {name}: {status}")
-                else:
-                    st.error(f"❌ {name}: {status}")
-            st.markdown("---")
+                st.write(f"{'✅' if ok else '❌'} {name}: {status}")
 
-    with st.expander("🧩 Newsdata.io (optional API)", expanded=False):
-        st.caption("Adds API-based headlines; merged with the same scoring, tags & digest.")
+    # Newsdata
+    with st.expander("🧩 Newsdata.io (optional)", expanded=False):
+        st.caption("Merge API headlines with the same scoring & summaries.")
         use_newsdata = st.checkbox("Use Newsdata.io", value=True)
-        # Pre-fill with the public key you shared. You can override with your private key.
         newsdata_key = st.text_input("API Key", value="pub_72ee7f1de10849be8847f7ad4e1b8810", type="password")
         newsdata_query = st.text_input("Query", value="tree crop commodities")
-        col_nd1, col_nd2, col_nd3 = st.columns(3)
-        with col_nd1:
-            nd_language = st.text_input("Language (e.g. en, fr) — optional", value="")
-        with col_nd2:
-            nd_country = st.text_input("Country code (e.g. gh, ng, ci) — optional", value="")
-        with col_nd3:
-            nd_category = st.text_input("Category (e.g. business, world) — optional", value="")
-        max_pages = st.slider("Newsdata pages (pagination)", 1, 5, 2, help="Each page can include multiple results (subject to plan).")
+        c1, c2, c3 = st.columns(3)
+        with c1: nd_language = st.text_input("Language (e.g., en, fr)", value="")
+        with c2: nd_country = st.text_input("Country (e.g., gh, ng, ci)", value="")
+        with c3: nd_category = st.text_input("Category (e.g., business)", value="")
+        nd_pages = st.slider("Newsdata pages", 1, 5, 2)
 
+    # Dates
     with st.expander("📅 Date Range", expanded=True):
-        date_option = st.radio("Date Selection Mode", ["Quick Select", "Custom Range"], horizontal=True)
-        if date_option == "Quick Select":
-            quick_options = {"Last 24 Hours": 1, "Last 3 Days": 3, "Last Week": 7, "Last 2 Weeks": 14, "Last Month": 30}
-            selected_quick = st.selectbox("Select time period", list(quick_options.keys()), index=2)
-            days_back = quick_options[selected_quick]
+        mode = st.radio("Mode", ["Quick Select", "Custom"], horizontal=True)
+        if mode == "Quick Select":
+            quick = {"Last 24 Hours": 1, "Last 3 Days": 3, "Last Week": 7, "Last 2 Weeks": 14, "Last Month": 30}
+            sel = st.selectbox("Window", list(quick.keys()), index=2)
             end_date = dt.datetime.now(dt.timezone.utc)
-            start_date = end_date - dt.timedelta(days=days_back)
+            start_date = end_date - dt.timedelta(days=quick[sel])
         else:
             c1, c2 = st.columns(2)
-            with c1:
-                sd = st.date_input("Start Date", value=dt.date.today() - dt.timedelta(days=7))
-            with c2:
-                ed = st.date_input("End Date", value=dt.date.today())
+            with c1: sd = st.date_input("Start", value=dt.date.today() - dt.timedelta(days=7))
+            with c2: ed = st.date_input("End", value=dt.date.today())
             start_date = dt.datetime.combine(sd, dt.time.min, tzinfo=dt.timezone.utc)
             end_date = dt.datetime.combine(ed, dt.time.max, tzinfo=dt.timezone.utc)
 
+    # Keywords & thresholds
     with st.expander("🔍 Keywords & Filters", expanded=True):
-        custom_kw = st.text_area("Add or edit keywords (comma-separated)", value=", ".join(DEFAULT_KEYWORDS), height=120)
-        keywords = [k.strip() for k in custom_kw.split(",") if k.strip()] or DEFAULT_KEYWORDS
-        min_relevance = st.slider("Minimum relevance score", 0.0, 1.0, 0.05, 0.01)
+        custom_kw = st.text_area("Keywords (comma-separated)", ", ".join(DEFAULT_KEYWORDS), height=100)
+        keywords = [k.strip() for k in custom_kw.split(",") if k.strip()]
+        min_relevance = st.slider("Min relevance", 0.0, 1.0, 0.05, 0.01)
+        per_source_cap = st.slider("Max articles per source", 5, 50, 20)
 
+    # Content settings
     with st.expander("📝 Content Settings", expanded=True):
         n_sent = st.slider("Sentences per summary", 2, 6, 3)
-        top_k = st.slider("Top items in digest", 5, 30, 12)
+        top_k = st.slider("Digest: top items", 5, 30, 12)
 
     st.markdown("---")
-    st.subheader("Resilience Options")
-    force_fetch = st.checkbox("⚡ Force fetch RSS even if validation fails", value=True)
-    ignore_recency = st.checkbox("🕒 Ignore RSS recency check (accept older feeds)", value=True)
+    st.subheader("🛡️ Resilience")
+    force_fetch = st.checkbox("⚡ Force RSS fetch if validation fails", value=True)
+    ignore_recency = st.checkbox("🕒 Ignore RSS recency check", value=True)
+    dedupe_across_sources = st.checkbox("🧹 Deduplicate across sources", value=True)
 
     st.markdown("---")
-    col_run, col_reset = st.columns(2)
-    with col_run:
+    colA, colB = st.columns(2)
+    with colA:
         run_btn = st.button("🚀 Scan Now", use_container_width=True)
-    with col_reset:
+    with colB:
         if st.button("♻️ Reset", use_container_width=True):
             st.rerun()
 
-# --------------------- Processing ---------------------
-def process_sources() -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    progress_placeholder = st.empty()
-    status_placeholder = st.empty()
-    progress_bar = st.progress(0.0)
+# ========================= Processing =========================
+def hash_key(*parts) -> str:
+    return hashlib.md5(("||".join([p or "" for p in parts])).encode("utf-8")).hexdigest()
 
-    def enrich_entry(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        try:
-            text = fetch_article_text(entry["link"]) if entry.get("link") else ""
-            base = entry.get("summary", "") or ""
-            body = text if len(text) > len(base) else base
+def process_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame(columns=["source","published","title","relevance","impact","auto_summary","link","image"])
+    # Deduplicate by (title, link) or fallback
+    seen = set()
+    cleaned = []
+    for r in rows:
+        key = hash_key(r.get("title",""), r.get("link",""))
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(r)
+    df = pd.DataFrame(cleaned)
+    if df.empty:  # ensure columns exist
+        return pd.DataFrame(columns=["source","published","title","relevance","impact","auto_summary","link","image"])
+    return df.sort_values("relevance", ascending=False).reset_index(drop=True)
 
-            relevance = keyword_relevance(" ".join([entry["title"], body]), keywords)
-            if relevance < min_relevance:
-                return None
+def enrich(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    try:
+        # Fetch article text + image
+        article_text, image_url = fetch_article_text_and_image(entry["link"]) if entry.get("link") else ("", FALLBACK_IMG)
+        base = entry.get("summary") or ""
+        body = article_text if len(article_text) > len(base) else base
 
-            summary = simple_extractive_summary(body, n_sentences=n_sent, keywords=keywords)
-            impact_tags = classify_impact(" ".join([entry["title"], body]))
-            return {
-                "source": entry["source"],
-                "title": entry["title"],
-                "link": entry["link"],
-                "published": entry["published"],
-                "relevance": relevance,
-                "impact": impact_tags,
-                "auto_summary": summary
-            }
-        except Exception as e:
-            logger.error(f"Failed to process entry {entry.get('link','')}: {e}")
+        # Relevance & summary
+        rel = keyword_relevance(" ".join([entry.get("title",""), body]), keywords)
+        if rel < min_relevance:
             return None
+        summary = simple_extractive_summary(body, n_sentences=n_sent, keywords=keywords)
+        impacts = classify_impact(" ".join([entry.get("title",""), body])) or ["General"]
 
-    # 1) Gather from RSS sources
-    total_sources = len(chosen_sources) + (1 if use_newsdata else 0)
-    completed_sources = 0
+        return {
+            "source": entry["source"],
+            "title": entry["title"],
+            "link": entry["link"],
+            "published": entry["published"],
+            "relevance": float(rel),
+            "impact": impacts,
+            "auto_summary": summary,
+            "image": image_url or FALLBACK_IMG,
+        }
+    except Exception:
+        return None
 
-    if chosen_sources:
-        for idx, src in enumerate(chosen_sources, 1):
-            try:
-                progress_placeholder.text(f"Processing source {idx}/{total_sources}: {urlparse(src).netloc}")
-                status_placeholder.info(f"Fetching RSS from {urlparse(src).netloc}...")
-                entries_raw = fetch_from_feed(src, start_date, end_date, force_fetch, ignore_recency)
-                completed_sources += 1
-                if not entries_raw:
-                    status_placeholder.warning(f"No entries found in feed: {src}")
-                    progress_bar.progress(completed_sources / total_sources)
-                    continue
+def fetch_all(chosen_sources: List[str]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    total_tasks = len(chosen_sources) + (1 if (use_newsdata and newsdata_key) else 0)
+    progress = st.progress(0.0)
+    info = st.empty()
 
-                status_placeholder.info(f"Processing {len(entries_raw)} RSS articles from {urlparse(src).netloc}...")
-                with ThreadPoolExecutor(max_workers=5) as executor:
-                    futures = {executor.submit(enrich_entry, {**e, "source": urlparse(src).netloc}): e for e in entries_raw}
-                    for fut in as_completed(futures):
-                        res = fut.result()
-                        if res: rows.append(res)
-                progress_bar.progress(completed_sources / total_sources)
+    # 1) RSS/Atom
+    for i, src in enumerate(chosen_sources, start=1):
+        info.info(f"Fetching RSS {i}/{max(1,total_tasks)}: {urlparse(src).netloc}")
+        raw_items = fetch_from_feed(src, start_date, end_date, force_fetch, ignore_recency)
+        if per_source_cap and raw_items:
+            raw_items = raw_items[:per_source_cap]
+        if not raw_items:
+            progress.progress(min(1.0, i / max(1,total_tasks)))
+            continue
 
-            except Exception as ex:
-                logger.error(f"Failed to process RSS {src}: {ex}")
-                st.warning(f"Failed to process {urlparse(src).netloc}: {ex}")
-                progress_bar.progress(completed_sources / total_sources)
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            futures = [ex.submit(enrich, {**e, "source": urlparse(src).netloc}) for e in raw_items]
+            for fut in as_completed(futures):
+                r = fut.result()
+                if r: rows.append(r)
+        progress.progress(min(1.0, i / max(1,total_tasks)))
 
-    # 2) Gather from Newsdata.io (optional)
+    # 2) Newsdata.io
     if use_newsdata and newsdata_key:
-        try:
-            progress_placeholder.text(f"Processing source {completed_sources+1}/{total_sources}: newsdata.io")
-            status_placeholder.info("Fetching Newsdata.io API results...")
-            nd_items = fetch_from_newsdata(
-                api_key=newsdata_key,
-                query=newsdata_query,
-                start_date=start_date,
-                end_date=end_date,
-                language=nd_language or None,
-                country=nd_country or None,
-                category=nd_category or None,
-                max_pages=max_pages,
-            )
-            completed_sources += 1
-            if nd_items:
-                status_placeholder.info(f"Processing {len(nd_items)} Newsdata.io items...")
-                with ThreadPoolExecutor(max_workers=5) as executor:
-                    futures = {executor.submit(enrich_entry, it): it for it in nd_items}
-                    for fut in as_completed(futures):
-                        res = fut.result()
-                        if res: rows.append(res)
-            else:
-                status_placeholder.warning("No Newsdata.io results for this query/time window.")
-            progress_bar.progress(completed_sources / total_sources)
-        except Exception as ex:
-            logger.warning(f"Newsdata.io processing error: {ex}")
-            progress_bar.progress(completed_sources / total_sources)
+        info.info(f"Fetching Newsdata.io {len(chosen_sources)+1}/{max(1,total_tasks)}")
+        nd_items = fetch_from_newsdata(
+            api_key=newsdata_key,
+            query=newsdata_query,
+            start_date=start_date,
+            end_date=end_date,
+            language=nd_language or None,
+            country=nd_country or None,
+            category=nd_category or None,
+            max_pages=nd_pages,
+        )
+        if per_source_cap and nd_items:
+            nd_items = nd_items[:per_source_cap]
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            futures = [ex.submit(enrich, it) for it in nd_items]
+            for fut in as_completed(futures):
+                r = fut.result()
+                if r: rows.append(r)
+        progress.progress(1.0)
 
-    progress_placeholder.empty()
-    status_placeholder.empty()
-    progress_bar.empty()
+    info.empty()
+    progress.empty()
     return rows
 
-def make_digest(df: pd.DataFrame, top_k: int = 12) -> str:
-    header = f"# {APP_NAME} — Daily Digest\n\n*{TAGLINE}*\n\n> {QUOTE}\n\n"
+def render_card(row: pd.Series):
+    pub = row["published"]
+    imp = " · ".join(row["impact"])
+    src = row["source"]
+    rel = f"{row['relevance']:.0%}"
+    title = row["title"]
+    link = row["link"]
+    img = row["image"] or FALLBACK_IMG
+    summary = row["auto_summary"] or ""
+
+    st.markdown(f"""
+    <div class="card">
+      <img class="thumb" src="{img}" alt="thumbnail">
+      <div class="card-body">
+        <div class="meta">{src} · {pub} · Relevance {rel}</div>
+        <div class="title">{title}</div>
+        <div class="badges">
+            {"".join([f'<span class="badge">{t}</span>' for t in row["impact"]])}
+        </div>
+        <div class="summary">{summary}</div>
+        <div style="margin-top:10px;">
+          <a class="link" href="{link}" target="_blank">Read full article →</a>
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+def ui_results(df: pd.DataFrame, top_k: int):
+    st.subheader("📊 Results")
     if df.empty:
-        return header + "_No relevant items found for the selected period._"
-    parts = [header, f"**Date:** {dt.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"]
-    for _, row in df.head(top_k).iterrows():
-        parts.append(
-            f"### {row['title']}\n"
-            f"- **Source:** {row['source']}  \n"
-            f"- **Published:** {row['published']}  \n"
-            f"- **Relevance:** {row['relevance']:.3f}  \n"
-            f"- **Impact:** {', '.join(row['impact'])}  \n"
-            f"- **Summary:** {row['auto_summary']}\n"
-            f"[Read more]({row['link']})\n\n---\n"
-        )
-    return "\n".join(parts)
+        st.warning("No relevant articles found. Try widening the date range or lowering the relevance threshold.")
+        return
 
-def main_app():
-    if not run_btn:
-        st.info("""
-**What this demo does:**  
-- 📰 Scans curated RSS/Atom feeds (and optional Newsdata.io API) for the last *N* days  
-- 📑 Fetches full article text where possible  
-- 🎯 Scores relevance against your **commodity & policy keywords**  
+    # Sticky filters
+    c1, c2 = st.columns(2)
+    with c1:
+        all_impacts = sorted({t for tags in df["impact"] for t in tags})
+        impact_filter = st.multiselect("Filter by impact", options=all_impacts, default=[])
+    with c2:
+        source_filter = st.multiselect("Filter by source", options=sorted(df["source"].unique()), default=[])
+
+    filtered = df.copy()
+    if impact_filter:
+        filtered = filtered[filtered["impact"].apply(lambda x: any(t in x for t in impact_filter))]
+    if source_filter:
+        filtered = filtered[filtered["source"].isin(source_filter)]
+
+    st.markdown('<div class="grid">', unsafe_allow_html=True)
+    for _, row in filtered.iterrows():
+        render_card(row)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # Digest
+    st.subheader("📝 Daily Digest")
+    digest_md = make_digest(filtered if (impact_filter or source_filter) else df, top_k=top_k)
+    st.markdown(digest_md)
+
+    # Downloads
+    st.subheader("⬇️ Downloads")
+    ts = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    export_df = filtered if (impact_filter or source_filter) else df
+    csv_name = f"oneafrica_pulse_{ts}.csv"
+    md_name = f"oneafrica_pulse_digest_{ts}.md"
+    st.download_button("📥 Download CSV", data=export_df.to_csv(index=False).encode("utf-8"),
+                       file_name=csv_name, mime="text/csv")
+    st.download_button("📥 Download Digest (Markdown)", data=digest_md.encode("utf-8"),
+                       file_name=md_name, mime="text/markdown")
+    st.info("💡 Tip: Paste the Markdown into an email, WhatsApp (as a code block), or your wiki for quick sharing.")
+
+# ========================= Main =========================
+if not run_btn:
+    st.info("""
+**What this demo does:**
+- 📰 Scans curated RSS/Atom feeds (+ optional Newsdata.io API) for the last *N* days  
+- 📑 Fetches full article text where possible + **thumbnails** (Open Graph)  
+- 🎯 Scores relevance against **your commodity & policy keywords**  
 - 📝 Auto-summarizes into 2–6 sentences  
-- 🏷️ Tags each item with impact labels (Supply Risk, FX & Policy, Logistics, etc.)  
-- 💾 Produces a **downloadable CSV** and **Daily Digest (Markdown)**
-        """)
-        st.markdown("This is a lightweight, API-friendly prototype — perfect for a live demo with One Africa Markets.")
-        return
-
-    # guard
+- 🏷️ Tags each item (Supply Risk, FX & Policy, Logistics, etc.)  
+- 💾 Outputs a **downloadable CSV** and **Daily Digest (Markdown)**
+    """)
+else:
     if not chosen_sources and not (use_newsdata and newsdata_key):
-        st.error("Please select at least one RSS source or enable Newsdata.io in the sidebar.")
-        return
-
-    with st.spinner("Scanning feeds/APIs, extracting content, and generating summaries..."):
-        rows = process_sources()
-        if not rows:
-            st.warning("No relevant articles found matching your criteria. Tip: widen your date window or lower the relevance threshold.")
-            return
-
-        df = pd.DataFrame(rows).sort_values(by=["relevance"], ascending=False).reset_index(drop=True)
-
-        tab1, tab2, tab3 = st.tabs(["📊 Results", "📝 Daily Digest", "⬇️ Downloads"])
-
-        with tab1:
-            st.success(f"Found {len(df)} relevant items.")
-            col1, col2 = st.columns(2)
-            with col1:
-                impact_filter = st.multiselect(
-                    "Filter by impact",
-                    options=sorted(set(tag for tags in df['impact'] for tag in tags)),
-                    default=[]
-                )
-            with col2:
-                source_filter = st.multiselect(
-                    "Filter by source",
-                    options=sorted(df['source'].unique()),
-                    default=[]
-                )
-
-            filtered_df = df.copy()
-            if impact_filter:
-                filtered_df = filtered_df[filtered_df['impact'].apply(lambda x: any(tag in x for tag in impact_filter))]
-            if source_filter:
-                filtered_df = filtered_df[filtered_df['source'].isin(source_filter)]
-
-            st.dataframe(
-                filtered_df[["source", "published", "title", "relevance", "impact", "auto_summary", "link"]],
-                height=450,
-                use_container_width=True
-            )
-
-        with tab2:
-            digest_md = make_digest(filtered_df if (impact_filter or source_filter) else df, top_k=top_k)
-            st.markdown(digest_md)
-
-        with tab3:
-            ts = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-            export_df = filtered_df if (impact_filter or source_filter) else df
-            csv_name = f"oneafrica_pulse_{ts}.csv"
-            md_name = f"oneafrica_pulse_digest_{ts}.md"
-            export_df.to_csv(csv_name, index=False)
-            with open(md_name, "w", encoding="utf-8") as f:
-                f.write(digest_md)
-            c1, c2 = st.columns(2)
-            with c1:
-                st.download_button("📥 Download CSV", data=open(csv_name, "rb"), file_name=csv_name, mime="text/csv")
-            with c2:
-                st.download_button("📥 Download Digest (Markdown)", data=open(md_name, "rb"), file_name=md_name, mime="text/markdown")
-            st.info("💡 Tip: Paste the Markdown into an email, WhatsApp (as a code block), or your wiki for quick sharing.")
-
-if __name__ == "__main__":
-    main_app()
+        st.error("Pick at least one RSS source or enable Newsdata.io.")
+    else:
+        with st.spinner("Scanning sources, extracting content, and generating summaries..."):
+            rows = fetch_all(chosen_sources)
+            if dedupe_across_sources:
+                # already deduped in process_rows but we can ensure again
+                pass
+            df = process_rows(rows)
+            ui_results(df, top_k)
