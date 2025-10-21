@@ -183,7 +183,7 @@ CARD_CSS = """
 
 /* FORCE readable colors regardless of Streamlit theme */
 .card .title {
-  color: #111827 !important;  /* slate-900 */
+  color: #111827 !important;
   font-weight: 800;
   font-size: 18px;
   margin: 6px 0 8px 0;
@@ -623,16 +623,33 @@ def make_digest(df: pd.DataFrame, top_k: int = 12) -> str:
         )
     return "\n".join(parts)
 
+# ======= HERO =======
 with st.container():
     st.markdown(f"""
     <div class="hero">
-        <div class="pill">🌍 OneAfrica Market Pulse</div>
+        <div class="pill">🌍 One Africa Market Pulse</div>
         <h1>{TAGLINE}</h1>
         <p>{QUOTE}</p>
     </div>
     """, unsafe_allow_html=True)
 
-# ========================= SINGLE COLLAPSIBLE CONFIG PANEL =========================
+# ======= ACTION BAR (OUTSIDE CONFIGURATIONS) =======
+st.markdown("<br>", unsafe_allow_html=True)
+act_c1, act_c2 = st.columns([3, 1])
+with act_c1:
+    st.markdown("### Actions")
+with act_c2:
+    pass
+
+act_b1, act_b2 = st.columns([1, 1])
+with act_b1:
+    run_btn = st.button("🚀 Scan Now", use_container_width=True, key="run_main")
+with act_b2:
+    if st.button("♻️ Reset", use_container_width=True, key="reset_main"):
+        st.session_state.clear()
+        st.rerun()
+
+# ========================= SINGLE COLLAPSIBLE CONFIG PANEL (no buttons here) =========================
 with st.sidebar:
     with st.expander("⚙️ Configurations", expanded=False):
         st.header("Settings")
@@ -719,14 +736,6 @@ with st.sidebar:
         force_fetch = st.checkbox("⚡ Force RSS fetch if validation fails", value=True, key="force")
         ignore_recency = st.checkbox("🕒 Ignore RSS recency check", value=True, key="ignore_recent")
         dedupe_across_sources = st.checkbox("🧹 Deduplicate across sources", value=True, key="dedupe")
-
-        st.markdown("---")
-        colA, colB = st.columns(2)
-        with colA:
-            run_btn = st.button("🚀 Scan Now", use_container_width=True, key="run")
-        with colB:
-            if st.button("♻️ Reset", use_container_width=True, key="reset"):
-                st.rerun()
 
 # ========================= Processing =========================
 def hash_key(*parts) -> str:
@@ -920,7 +929,7 @@ This doesn’t affect your ability to scan and summarize current items.
 st.markdown(CARD_CSS, unsafe_allow_html=True)
 
 if 'run_btn' not in locals():
-    run_btn = False  # safety if sidebar didn't render for some reason
+    run_btn = False  # safety
 
 if not run_btn:
     st.info("""
@@ -934,8 +943,14 @@ if not run_btn:
     """)
 else:
     try:
+        if not 'chosen_sources' in locals():
+            chosen_sources = []
+        if not 'use_newsdata' in locals():
+            use_newsdata = False
+        if not 'newsdata_key' in locals():
+            newsdata_key = ""
         if not chosen_sources and not (use_newsdata and newsdata_key):
-            st.error("Pick at least one RSS source or enable Newsdata.io.")
+            st.error("Pick at least one RSS source or enable Newsdata.io (see Configurations).")
         else:
             with st.spinner("Scanning sources, extracting content, and generating summaries..."):
                 rows = fetch_all(chosen_sources)
