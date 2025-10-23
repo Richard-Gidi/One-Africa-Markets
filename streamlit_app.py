@@ -951,7 +951,7 @@ def friendly_error_summary():
     bullets = "".join([f"- {msg} _(x{n})_\n" for msg, n in counts.items()])
     st.info(f"""
 **Heads up:** Some sources were temporarily skipped or partially loaded.  
-This doesn't affect your ability to scan and summarize current items.
+This doesnt affect your ability to scan and summarize current items.
 
 {bullets}
     """)
