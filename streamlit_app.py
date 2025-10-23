@@ -21,7 +21,6 @@ from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 import xml.etree.ElementTree as ET
 import logging
-from dataclasses import dataclass
 
 # ==== resilient .env loader ====
 try:
@@ -160,23 +159,6 @@ IMPACT_RULES = {
         r"\b(?:research|development|r&d)\b",
         r"\b(?:startup|fintech|agtech)\b",
     ],
-}
-
-# ========= Extra vocab for heuristics (used elsewhere, harmless here even for LLM-only) =========
-COMMODITY_TERMS = {
-    "cashew": ["cashew", "rcn", "raw cashew", "cashew kernel"],
-    "shea": ["shea", "shea nut", "shea butter", "karite"],
-    "cocoa": ["cocoa", "cocoa bean", "cocobod", "grinder", "chocolate"],
-    "palm": ["palm", "palm kernel", "pko", "palm oil", "cpo", "olein", "stearin"],
-}
-REGION_TERMS = {
-    "Ghana": ["ghana", "accra", "tema", "takoradi"],
-    "Nigeria": ["nigeria", "lagos", "apapa", "tin can", "onitsha"],
-    "Côte d’Ivoire": ["côte d’ivoire", "ivory coast", "abidjan", "san pedro"],
-    "Benin": ["benin", "cotonou"],
-    "Togo": ["togo", "lomé", "lome"],
-    "Burkina Faso": ["burkina", "ouagadougou", "bobo-dioulasso"],
-    "West Africa (General)": ["west africa", "sahel", "ecowas"]
 }
 
 # ========================= Streamlit UI CSS =========================
@@ -442,7 +424,7 @@ def fetch_feed_raw(url: str, timeout: int = 20) -> bytes:
             soft_fail("Skipped a source that returned a non-200 response.", f"fetch_feed_raw {url} -> {r.status_code}")
         return r.content if r.status_code == 200 else (r.content or b"")
     except Exception as e:
-        soft_fail("Temporarily skipped one source due to connectivity.", f"fetch_feed_raw EXC {url}: {e}")
+        soft_fail("Temporarily skipped one source due to connectivity.", f"fetch_feed_raw EXC {e}")
         return b""
 
 def parse_feed_xml(content: bytes, base_url: str) -> List[Dict[str, str]]:
@@ -669,12 +651,12 @@ with act_b2:
         st.session_state.clear()
         st.rerun()
 
-# ======= QUICK LLM ANALYZE BY URL (pure LLM) =======
+# ======= Quick Analyze by URL (LLM-only) =======
 st.markdown("### 🔗 Quick Analyze by URL (LLM)")
-url_col, btn_col = st.columns([4,1])
-with url_col:
+qa_col1, qa_col2 = st.columns([4,1])
+with qa_col1:
     quick_url = st.text_input("Paste any article URL", value="", placeholder="https://example.com/article")
-with btn_col:
+with qa_col2:
     run_quick = st.button("Analyze", use_container_width=True, key="an_quick")
 
 # ======= CHAT ASSISTANT (resilient with fallbacks) =======
@@ -698,13 +680,17 @@ def have_openai():
 def get_openai_client():
     try:
         # If you use the standard OpenAI endpoint, remove base_url arg.
-        # Kept here to match your prior setup.
+        # This base_url was in your last version; keeping as-is.
         return OpenAI(api_key=get_openai_api_key(), base_url="https://models.github.ai/inference")
     except Exception as e:
         logger.warning(f"OpenAI client init failed: {e}")
         return None
 
 def generate_assistant_reply(messages, temperature: float = 0.4):
+    """
+    Try models in order; stream first, then non-stream fallback.
+    Return (text_or_None, streamed_bool). Never raises to UI.
+    """
     if not have_openai():
         return None, False
     client = get_openai_client()
@@ -754,8 +740,7 @@ def generate_assistant_reply(messages, temperature: float = 0.4):
             )
             reply = (comp.choices[0].message.content or "").strip()
             if reply:
-                if not _:
-                    pass
+                # NOTE: We don't render here to avoid double-rendering.
                 return reply, False
         except Exception as e2:
             logger.warning(f"OpenAI non-streaming failed on {model}: {e2}")
@@ -785,6 +770,7 @@ if user_prompt:
     else:
         reply, _streamed = generate_assistant_reply(st.session_state.chat_history)
         if reply:
+            # >>> FIX: if not streamed, render immediately so user sees it now
             if not _streamed:
                 with st.chat_message("assistant"):
                     st.markdown(reply)
@@ -793,7 +779,7 @@ if user_prompt:
             with st.chat_message("assistant"):
                 st.error("The assistant is temporarily unavailable. Please try again in a moment.")
 
-# ========================= LLM-ONLY ARTICLE ANALYSIS ENGINE =========================
+# ========================= LLM-only Article Analysis =========================
 @st.cache_data(ttl=30*60, show_spinner=False)
 def _llm_analyze_article_cached(model: str, title: str, body: str, tags: List[str]) -> str:
     """
@@ -847,6 +833,7 @@ Constraints:
 def analyze_with_llm(title: str, body: str, tags: List[str]) -> str:
     """
     Try preferred models in order; return the first successful analysis as Markdown text.
+    Pure LLM only (no rule-based fallback).
     """
     if not have_openai():
         return ""
@@ -866,6 +853,110 @@ def analyze_with_llm(title: str, body: str, tags: List[str]) -> str:
             logger.warning(f"LLM analyze failed on {m}: {e}")
             continue
     return ""
+
+# ========================= SINGLE COLLAPSIBLE CONFIG PANEL =========================
+with st.sidebar:
+    with st.expander("⚙️ Configurations", expanded=False):
+        st.header("Settings")
+
+        # 📰 RSS/Atom Sources
+        st.subheader("📰 RSS/Atom Sources")
+        chosen_sources: List[str] = []
+        for name, url in DEFAULT_SOURCES.items():
+            if st.checkbox(name, value=True, key=f"src_{name}"):
+                chosen_sources.append(url)
+        if st.button("🔄 Check Feeds", key="check_feeds"):
+            for name, url in DEFAULT_SOURCES.items():
+                ok, status = validate_feed(url, ignore_recency_check=True)
+                st.write(f"{'✅' if ok else '❌'} {name}: {status}")
+
+        st.markdown("---")
+
+        # 🧩 Newsdata.io (optional)
+        st.subheader("🧩 Newsdata.io (optional)")
+        st.caption("Merge API headlines with the same scoring & summaries.")
+        use_newsdata = st.checkbox("Use Newsdata.io", value=True, key="use_nd")
+
+        auto_key = get_newsdata_api_key()
+        override = st.checkbox("Temporarily override API key (not saved)", value=False, key="nd_override")
+        tmp_key = st.text_input("Enter API key", type="password", key="nd_key_input") if override else ""
+        newsdata_key = (tmp_key or auto_key).strip()
+
+        if use_newsdata:
+            if newsdata_key:
+                st.success("Using secured API key.")
+            else:
+                st.warning("No API key found. Add NEWSDATA_API_KEY to `.env`/Secrets, or use a temporary override.")
+
+        newsdata_query = st.text_input("Query", value="tree crop commodities", key="nd_query")
+        c1, c2, c3 = st.columns(3)
+        with c1: nd_language = st.text_input("Language (e.g., en, fr)", value="", key="nd_lang")
+        with c2: nd_country = st.text_input("Country (e.g., gh, ng, ci)", value="", key="nd_cty")
+        with c3: nd_category = st.text_input("Category (e.g., business)", value="", key="nd_cat")
+        nd_pages = st.number_input("Newsdata pages", min_value=1, max_value=10, value=2, step=1, key="nd_pages")
+
+        st.markdown("---")
+
+        # 📅 Date Range
+        st.subheader("📅 Date Range")
+        mode = st.radio("Mode", ["Quick Select", "Custom"], horizontal=True, key="date_mode")
+        if mode == "Quick Select":
+            quick = {"Last 24 Hours": 1, "Last 3 Days": 3, "Last Week": 7, "Last 2 Weeks": 14, "Last Month": 30}
+            sel = st.selectbox("Window", list(quick.keys()), index=2, key="date_win")
+            end_date = dt.datetime.now(dt.timezone.utc)
+            start_date = end_date - dt.timedelta(days=quick[sel])
+        else:
+            d1, d2 = st.columns(2)
+            with d1: sd = st.date_input("Start", value=dt.date.today() - dt.timedelta(days=7), key="start_date")
+            with d2: ed = st.date_input("End", value=dt.date.today(), key="end_date")
+            start_date = dt.datetime.combine(sd, dt.time.min, tzinfo=dt.timezone.utc)
+            end_date = dt.datetime.combine(ed, dt.time.max, tzinfo=dt.timezone.utc)
+
+        st.markdown("---")
+
+        # 🔍 Keywords & Filters
+        st.subheader("🔍 Keywords & Filters")
+        custom_kw = st.text_area("Keywords (comma-separated)", ", ".join(DEFAULT_KEYWORDS), height=100, key="kw_text")
+        keywords = [k.strip() for k in custom_kw.split(",") if k.strip()]
+        min_relevance = st.number_input("Min relevance (0.00–1.00)", min_value=0.0, max_value=1.0, value=0.05, step=0.01, format="%.2f", key="min_rel")
+        per_source_cap = st.number_input("Max articles per source", min_value=1, max_value=200, value=20, step=1, key="cap")
+
+        st.markdown("---")
+
+        # 📝 Content Settings
+        st.subheader("📝 Content Settings")
+        n_sent = st.number_input("Sentences per summary", min_value=2, max_value=10, value=3, step=1, key="n_sent")
+        top_k = st.number_input("Digest: top items", min_value=5, max_value=100, value=12, step=1, key="top_k")
+
+        st.markdown("---")
+
+        # 🛡️ Resilience
+        st.subheader("🛡️ Resilience")
+        force_fetch = st.checkbox("⚡ Force RSS fetch if validation fails", value=True, key="force")
+        ignore_recency = st.checkbox("🕒 Ignore RSS recency check", value=True, key="ignore_recent")
+        dedupe_across_sources = st.checkbox("🧹 Deduplicate across sources", value=True, key="dedupe")
+
+# Quick Analyze trigger (uses LLM only)
+if run_quick:
+    if not have_openai():
+        st.warning("Add an `OPENAI_API_KEY` to use AI analysis.")
+    elif not quick_url:
+        st.info("Please paste a valid URL.")
+    else:
+        with st.spinner("Fetching and analyzing..."):
+            text, img = fetch_article_text_and_image(quick_url)
+            if not text:
+                st.error("Could not extract article text from this URL.")
+            else:
+                title_guess = text.split(".")[0][:140] if text else quick_url
+                tags = classify_impact(text)
+                md = analyze_with_llm(title_guess, text, tags)
+                if not md:
+                    st.error("AI analysis failed. Please try again.")
+                else:
+                    st.image(img, use_column_width=True)
+                    st.markdown(f"**Source:** {urlparse(quick_url).netloc}")
+                    st.markdown(md)
 
 # ========================= Processing =========================
 def hash_key(*parts) -> str:
@@ -893,7 +984,6 @@ def enrich(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         base = entry.get("summary") or ""
         body = article_text if len(article_text) > len(base) else base
 
-        # Note: relevance uses DEFAULT_KEYWORDS provided by user via sidebar later
         rel = keyword_relevance(" ".join([entry.get("title",""), body]), keywords)
         if rel < min_relevance:
             return None
@@ -976,7 +1066,7 @@ def fetch_all(chosen_sources: List[str]) -> List[Dict[str, Any]]:
     progress.empty()
     return rows
 
-# ========================= LLM-INTEGRATED CARD RENDERER (PURE LLM) =========================
+# ========================= Card Renderer with LLM-only Analysis =========================
 def render_card(row: pd.Series):
     pub = row["published"]
     src = row["source"]
@@ -1027,7 +1117,6 @@ def render_card(row: pd.Series):
                 else:
                     st.markdown(md)
 
-# ========================= RESULTS UI =========================
 def ui_results(df: pd.DataFrame, top_k: int):
     st.subheader("📊 Results")
     if df.empty:
@@ -1081,22 +1170,39 @@ This doesn’t affect your ability to scan and summarize current items.
 {bullets}
     """)
 
-# ========================= Sidebar Config =========================
-with st.sidebar:
-    with st.expander("⚙️ Configurations", expanded=False):
-        st.header("Settings")
+# ========================= Main =========================
+st.markdown(CARD_CSS, unsafe_allow_html=True)
 
-        # 📰 RSS/Atom Sources
-        st.subheader("📰 RSS/Atom Sources")
-        chosen_sources: List[str] = []
-        for name, url in DEFAULT_SOURCES.items():
-            if st.checkbox(name, value=True, key=f"src_{name}"):
-                chosen_sources.append(url)
-        if st.button("🔄 Check Feeds", key="check_feeds"):
-            for name, url in DEFAULT_SOURCES.items():
-                ok, status = validate_feed(url, ignore_recency_check=True)
-                st.write(f"{'✅' if ok else '❌'} {name}: {status}")
+if 'run_btn' not in locals():
+    run_btn = False  # safety
 
-        st.markdown("---")
-
-        #
+if not run_btn:
+    st.info("""
+**What this demo does:**
+- 📰 Scans curated RSS/Atom feeds (+ optional Newsdata.io API) for the last *N* days  
+- 📑 Fetches full article text where possible + **thumbnails** (Open Graph)  
+- 🎯 Scores relevance against **your commodity & policy keywords**  
+- 📝 Auto-summarizes into 2–6 sentences  
+- 🏷️ Tags each item (Supply Risk, FX & Policy, Logistics, etc.)  
+- 💾 Outputs a **downloadable CSV** and **Daily Digest (Markdown)**
+    """)
+else:
+    try:
+        if 'chosen_sources' not in locals():
+            chosen_sources = []
+        if 'use_newsdata' not in locals():
+            use_newsdata = False
+        if 'newsdata_key' not in locals():
+            newsdata_key = ""
+        if not chosen_sources and not (use_newsdata and newsdata_key):
+            st.error("Pick at least one RSS source or enable Newsdata.io (see Configurations).")
+        else:
+            with st.spinner("Scanning sources, extracting content, and generating summaries..."):
+                rows = fetch_all(chosen_sources)
+                df = process_rows(rows)
+                ui_results(df, top_k)
+    except Exception as e:
+        soft_fail("Something went wrong while assembling the results.", f"MAIN EXC {e}")
+        st.error("We ran into a hiccup assembling the results. Please try again or adjust your filters.")
+    finally:
+        friendly_error_summary()
