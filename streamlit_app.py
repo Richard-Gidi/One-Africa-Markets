@@ -724,18 +724,20 @@ def render_card(row: pd.Series):
     # Create unique key for this article
     article_key = hash_key(title, link)
     
+    badges_html = "".join([f'<span class="badge">{t}</span>' for t in row["impact"]])
+    
     st.markdown(f"""
     <div class="card">
       <img class="thumb" src="{img}" alt="thumbnail">
       <div class="card-body">
-        <div class="meta">{src} · {pub} · Relevance {rel}</div>
+        <div class="meta">{src} &middot; {pub} &middot; Relevance {rel}</div>
         <div class="title">{title}</div>
         <div class="badges">
-            {"".join([f'<span class="badge">{t}</span>' for t in row["impact"]])}
+            {badges_html}
         </div>
         <div class="summary">{summary}</div>
         <div style="margin-top:10px;">
-          <a class="link" href="{link}" target="_blank">Read full article →</a>
+          <a class="link" href="{link}" target="_blank">Read full article &rarr;</a>
         </div>
       </div>
     </div>
