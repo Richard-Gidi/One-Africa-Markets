@@ -60,7 +60,7 @@ except Exception:
 # ========================= App Strings / Theme =========================
 APP_NAME = "One Africa Market Pulse"
 TAGLINE = "Automated intelligence for cashew, shea, cocoa & allied markets."
-QUOTE = "“Ask your data why, until it has nothing else to say.” — Richard Gidi"
+QUOTE = ""Ask your data why, until it has nothing else to say." — Richard Gidi"
 
 # Fallback image for articles with no thumbnail
 FALLBACK_IMG = "https://images.unsplash.com/photo-1519681393784-d120267933ba?q=80&w=1200&auto=format&fit=crop"
@@ -69,7 +69,7 @@ DEFAULT_KEYWORDS = [
     "cashew", "shea", "shea nut", "cocoa", "palm kernel", "agri", "export", "harvest",
     "shipment", "freight", "logistics", "port", "tariff", "ban", "fx", "currency",
     "cedi", "naira", "inflation", "subsidy", "cooperative", "value-addition", "processing",
-    "ghana", "nigeria", "cote d’ivoire", "ivory coast", "benin", "togo", "burkina",
+    "ghana", "nigeria", "cote d'ivoire", "ivory coast", "benin", "togo", "burkina",
     "west africa", "sahel", "trade policy", "commodity", "price", "market"
 ]
 
@@ -259,7 +259,7 @@ def fetch_page(url: str, timeout: int = 12) -> str:
         }
         r = get_session().get(url, headers=headers, timeout=timeout)
         if r.status_code != 200:
-            soft_fail("Skipped a page that didn’t load cleanly.", f"fetch_page {url} -> {r.status_code}")
+            soft_fail("Skipped a page that didn't load cleanly.", f"fetch_page {url} -> {r.status_code}")
             return ""
         return r.text
     except Exception as e:
@@ -609,75 +609,24 @@ def fetch_from_newsdata(
             continue
     return items
 
-# ========================= UI Helpers =========================
-st.set_page_config(page_title=APP_NAME, page_icon="🌍", layout="wide", initial_sidebar_state="expanded")
-st.markdown(CARD_CSS, unsafe_allow_html=True)
-
-def make_digest(df: pd.DataFrame, top_k: int = 12) -> str:
-    header = f"# {APP_NAME} — Daily Digest\n\n*{TAGLINE}*\n\n> {QUOTE}\n\n"
-    if df.empty:
-        return header + "_No relevant items found for the selected period._"
-    parts = [header, f"**Date:** {dt.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"]
-    for _, row in df.head(top_k).iterrows():
-        impact = ", ".join(row["impact"])
-        parts.append(
-            f"### {row['title']}\n"
-            f"- **Source:** {row['source']}  \n"
-            f"- **Published:** {row['published']}  \n"
-            f"- **Relevance:** {row['relevance']:.3f}  \n"
-            f"- **Impact:** {impact}  \n"
-            f"- **Summary:** {row['auto_summary']}\n"
-            f"[Read more]({row['link']})\n\n---\n"
-        )
-    return "\n".join(parts)
-
-# ======= HERO =======
-with st.container():
-    st.markdown(f"""
-    <div class="hero">
-        <div class="pill">🌍 One Africa Market Pulse</div>
-        <h1>{TAGLINE}</h1>
-        <p>{QUOTE}</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-# ======= ACTION BAR =======
-st.markdown("<br>", unsafe_allow_html=True)
-act_b1, act_b2 = st.columns([1, 1])
-with act_b1:
-    run_btn = st.button("🚀 Scan Now", use_container_width=True, key="run_main")
-with act_b2:
-    if st.button("♻️ Reset", use_container_width=True, key="reset_main"):
-        st.session_state.clear()
-        st.rerun()
-
-# ======= CHAT ASSISTANT (resilient with fallbacks) =======
-st.markdown("### 🤖 Chat Assistant")
-st.caption("Ask follow-ups, draft digests, or generate summaries. Uses your `.env`/Secrets OPENAI_API_KEY if available.")
-
-def init_chat_state():
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = [
-            {"role": "system", "content": (
-                "You are a crisp market-intelligence assistant for West African tree crops "
-                "(cashew, shea, cocoa, palm kernel). Be concise, cite assumptions, and suggest "
-                "actionable next steps. If asked to summarize a table, write bullet points."
-            )}
-        ]
-init_chat_state()
-
+# ========================= AI Analysis Functions =========================
 def have_openai():
     return OPENAI_OK and bool(get_openai_api_key())
 
 def get_openai_client():
     try:
-        # If you use the standard OpenAI endpoint, remove base_url arg.
-        # This base_url was in your last version; keeping as-is.
-        return OpenAI(api_key=get_openai_api_key(), base_url="https://models.github.ai/inference")
+        return OpenAI(api_key=get_openai_api_key())
     except Exception as e:
         logger.warning(f"OpenAI client init failed: {e}")
         return None
 
+def analyze_article_with_ai(title: str, summary: str, full_text: str, link: str) -> Optional[str]:
+    """
+    Uses OpenAI to provide deep analysis of an article including:
+    - Meaning & key insights
+    - Market impact
+    - Business opportunities
+    - Risk factors
 def generate_assistant_reply(messages, temperature: float = 0.4):
     """
     Try models in order; stream first, then non-stream fallback.
@@ -732,7 +681,6 @@ def generate_assistant_reply(messages, temperature: float = 0.4):
             )
             reply = (comp.choices[0].message.content or "").strip()
             if reply:
-                # NOTE: We don't render here to avoid double-rendering.
                 return reply, False
         except Exception as e2:
             logger.warning(f"OpenAI non-streaming failed on {model}: {e2}")
@@ -741,6 +689,309 @@ def generate_assistant_reply(messages, temperature: float = 0.4):
 
     soft_fail("Assistant is temporarily unavailable.", f"OpenAI failures: {last_err}")
     return None, False
+
+# ========================= UI Helpers =========================
+def hash_key(*parts) -> str:
+    return hashlib.md5(("||".join([p or "" for p in parts])).encode("utf-8")).hexdigest()
+
+def make_digest(df: pd.DataFrame, top_k: int = 12) -> str:
+    header = f"# {APP_NAME} — Daily Digest\n\n*{TAGLINE}*\n\n> {QUOTE}\n\n"
+    if df.empty:
+        return header + "_No relevant items found for the selected period._"
+    parts = [header, f"**Date:** {dt.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"]
+    for _, row in df.head(top_k).iterrows():
+        impact = ", ".join(row["impact"])
+        parts.append(
+            f"### {row['title']}\n"
+            f"- **Source:** {row['source']}  \n"
+            f"- **Published:** {row['published']}  \n"
+            f"- **Relevance:** {row['relevance']:.3f}  \n"
+            f"- **Impact:** {impact}  \n"
+            f"- **Summary:** {row['auto_summary']}\n"
+            f"[Read more]({row['link']})\n\n---\n"
+        )
+    return "\n".join(parts)
+
+def render_card(row: pd.Series):
+    pub = row["published"]
+    src = row["source"]
+    rel = f"{row['relevance']:.0%}"
+    title = row["title"]
+    link = row["link"]
+    img = row["image"] or FALLBACK_IMG
+    summary = row["auto_summary"] or ""
+    
+    # Create unique key for this article
+    article_key = hash_key(title, link)
+    
+    st.markdown(f"""
+    <div class="card">
+      <img class="thumb" src="{img}" alt="thumbnail">
+      <div class="card-body">
+        <div class="meta">{src} · {pub} · Relevance {rel}</div>
+        <div class="title">{title}</div>
+        <div class="badges">
+            {"".join([f'<span class="badge">{t}</span>' for t in row["impact"]])}
+        </div>
+        <div class="summary">{summary}</div>
+        <div style="margin-top:10px;">
+          <a class="link" href="{link}" target="_blank">Read full article →</a>
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # AI Analysis Section
+    if have_openai():
+        with st.container():
+            col1, col2 = st.columns([1, 4])
+            with col1:
+                analyze_btn = st.button("🤖 AI Analysis", key=f"analyze_{article_key}", use_container_width=True)
+            with col2:
+                st.caption("Get deep insights, opportunities & recommendations")
+            
+            if analyze_btn:
+                with st.spinner("Analyzing article with AI..."):
+                    # Fetch full article text if not already in row
+                    full_text = row.get("full_text", "")
+                    if not full_text:
+                        full_text, _ = fetch_article_text_and_image(link)
+                    
+                    analysis = analyze_article_with_ai(title, summary, full_text, link)
+                    
+                    if analysis:
+                        with st.expander("📊 AI Analysis Results", expanded=True):
+                            st.markdown(analysis)
+                            st.caption(f"Analysis generated for: {title}")
+                    else:
+                        st.error("AI analysis temporarily unavailable. Please try again.")
+
+def process_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
+    if not rows:
+        return pd.DataFrame(columns=["source","published","title","relevance","impact","auto_summary","link","image"])
+    seen = set()
+    cleaned = []
+    for r in rows:
+        key = hash_key(r.get("title",""), r.get("link",""))
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(r)
+    df = pd.DataFrame(cleaned)
+    if df.empty:
+        return pd.DataFrame(columns=["source","published","title","relevance","impact","auto_summary","link","image"])
+    return df.sort_values("relevance", ascending=False).reset_index(drop=True)
+
+def enrich(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    try:
+        article_text, image_url = fetch_article_text_and_image(entry.get("link",""))
+        base = entry.get("summary") or ""
+        body = article_text if len(article_text) > len(base) else base
+
+        rel = keyword_relevance(" ".join([entry.get("title",""), body]), keywords)
+        if rel < min_relevance:
+            return None
+        summary = simple_extractive_summary(body, n_sentences=n_sent, keywords=keywords)
+        impacts = classify_impact(" ".join([entry.get("title",""), body])) or ["General"]
+
+        return {
+            "source": entry.get("source",""),
+            "title": entry.get("title","(untitled)"),
+            "link": entry.get("link",""),
+            "published": entry.get("published","Date unknown"),
+            "relevance": float(rel),
+            "impact": impacts,
+            "auto_summary": summary,
+            "image": image_url or FALLBACK_IMG,
+        }
+    except Exception as e:
+        soft_fail("Skipped one article that couldn't be processed.", f"enrich EXC {e}")
+        return None
+
+def fetch_all(chosen_sources: List[str]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    total_tasks = len(chosen_sources) + (1 if (use_newsdata and newsdata_key) else 0)
+    total_tasks = max(total_tasks, 1)
+    progress = st.progress(0.0)
+    info = st.empty()
+
+    # 1) RSS/Atom
+    for i, src in enumerate(chosen_sources, start=1):
+        info.info(f"Fetching RSS {i}/{total_tasks}: {urlparse(src).netloc}")
+        try:
+            raw_items = fetch_from_feed(src, start_date, end_date, force_fetch, ignore_recency)
+        except Exception as e:
+            soft_fail("Skipped a source due to a transient issue.", f"fetch_from_feed EXC {src}: {e}")
+            raw_items = []
+        if per_source_cap and raw_items:
+            raw_items = raw_items[:per_source_cap]
+
+        if raw_items:
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                futures = [ex.submit(enrich, {**e, "source": urlparse(src).netloc}) for e in raw_items]
+                for fut in as_completed(futures):
+                    try:
+                        r = fut.result()
+                        if r: rows.append(r)
+                    except Exception as e:
+                        soft_fail("One article was skipped during processing.", f"future enrich EXC {e}")
+        progress.progress(min(1.0, i / total_tasks))
+
+    # 2) Newsdata.io
+    if use_newsdata and newsdata_key:
+        info.info(f"Fetching Newsdata.io {len(chosen_sources)+1}/{total_tasks}")
+        try:
+            nd_items = fetch_from_newsdata(
+                api_key=newsdata_key,
+                query=newsdata_query,
+                start_date=start_date,
+                end_date=end_date,
+                language=nd_language or None,
+                country=nd_country or None,
+                category=nd_category or None,
+                max_pages=int(nd_pages),
+            )
+            if per_source_cap and nd_items:
+                nd_items = nd_items[:per_source_cap]
+            if nd_items:
+                with ThreadPoolExecutor(max_workers=6) as ex:
+                    futures = [ex.submit(enrich, it) for it in nd_items]
+                    for fut in as_completed(futures):
+                        try:
+                            r = fut.result()
+                            if r: rows.append(r)
+                        except Exception as e:
+                            soft_fail("One API article was skipped during processing.", f"future API enrich EXC {e}")
+        except Exception as e:
+            soft_fail("The API was briefly unavailable; results shown are from RSS.", f"fetch_from_newsdata EXC {e}")
+        progress.progress(1.0)
+
+    info.empty()
+    progress.empty()
+    return rows
+
+def ui_results(df: pd.DataFrame, top_k: int):
+    st.subheader("📊 Results")
+    if df.empty:
+        st.warning("No relevant articles found. Try widening the date range or lowering the relevance threshold.")
+        return
+
+    c1, c2 = st.columns(2)
+    with c1:
+        all_impacts = sorted({t for tags in df["impact"] for t in tags})
+        impact_filter = st.multiselect("Filter by impact", options=all_impacts, default=[])
+    with c2:
+        source_filter = st.multiselect("Filter by source", options=sorted(df["source"].unique()), default=[])
+
+    filtered = df.copy()
+    if impact_filter:
+        filtered = filtered[filtered["impact"].apply(lambda x: any(t in x for t in impact_filter))]
+    if source_filter:
+        filtered = filtered[filtered["source"].isin(source_filter)]
+
+    st.markdown('<div class="grid">', unsafe_allow_html=True)
+    for _, row in filtered.iterrows():
+        render_card(row)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.subheader("📝 Daily Digest")
+    digest_md = make_digest(filtered if (impact_filter or source_filter) else df, top_k=top_k)
+    st.markdown(digest_md)
+
+    st.subheader("⬇️ Downloads")
+    ts = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    export_df = filtered if (impact_filter or source_filter) else df
+    csv_name = f"oneafrica_pulse_{ts}.csv"
+    md_name = f"oneafrica_pulse_digest_{ts}.md"
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.download_button("📥 Download CSV", data=export_df.to_csv(index=False).encode("utf-8"),
+                           file_name=csv_name, mime="text/csv")
+    with col2:
+        st.download_button("📥 Download Digest (Markdown)", data=digest_md.encode("utf-8"),
+                           file_name=md_name, mime="text/markdown")
+    with col3:
+        if have_openai() and not export_df.empty:
+            num_to_analyze = min(5, len(export_df))
+            if st.button(f"🤖 Batch Analyze Top {num_to_analyze}", key="batch_analyze"):
+                with st.spinner(f"Analyzing top {num_to_analyze} articles..."):
+                    analyses = []
+                    for idx, row in export_df.head(num_to_analyze).iterrows():
+                        full_text, _ = fetch_article_text_and_image(row["link"])
+                        analysis = analyze_article_with_ai(
+                            row["title"], 
+                            row["auto_summary"], 
+                            full_text, 
+                            row["link"]
+                        )
+                        if analysis:
+                            analyses.append(f"## {row['title']}\n\n{analysis}\n\n---\n")
+                    
+                    if analyses:
+                        batch_report = "\n".join(analyses)
+                        st.download_button(
+                            "📥 Download Batch Analysis Report",
+                            data=batch_report.encode("utf-8"),
+                            file_name=f"oneafrica_ai_analysis_{ts}.md",
+                            mime="text/markdown"
+                        )
+                        st.success(f"✅ Analyzed {len(analyses)} articles!")
+    
+    st.info("💡 Tip: Paste the Markdown into an email, WhatsApp (as a code block), or your wiki for quick sharing.")
+
+def friendly_error_summary():
+    if not SOFT_ERRORS:
+        return
+    counts: Dict[str,int] = {}
+    for m in SOFT_ERRORS:
+        counts[m] = counts.get(m, 0) + 1
+    bullets = "".join([f"- {msg} _(x{n})_\n" for msg, n in counts.items()])
+    st.info(f"""
+**Heads up:** Some sources were temporarily skipped or partially loaded.  
+This doesn't affect your ability to scan and summarize current items.
+
+{bullets}
+    """)
+
+# ========================= Streamlit App Setup =========================
+st.set_page_config(page_title=APP_NAME, page_icon="🌍", layout="wide", initial_sidebar_state="expanded")
+st.markdown(CARD_CSS, unsafe_allow_html=True)
+
+# ======= HERO =======
+with st.container():
+    st.markdown(f"""
+    <div class="hero">
+        <div class="pill">🌍 One Africa Market Pulse</div>
+        <h1>{TAGLINE}</h1>
+        <p>{QUOTE}</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+# ======= ACTION BAR =======
+st.markdown("<br>", unsafe_allow_html=True)
+act_b1, act_b2 = st.columns([1, 1])
+with act_b1:
+    run_btn = st.button("🚀 Scan Now", use_container_width=True, key="run_main")
+with act_b2:
+    if st.button("♻️ Reset", use_container_width=True, key="reset_main"):
+        st.session_state.clear()
+        st.rerun()
+
+# ======= CHAT ASSISTANT (resilient with fallbacks) =======
+st.markdown("### 🤖 Chat Assistant")
+st.caption("Ask follow-ups, draft digests, or generate summaries. Uses your `.env`/Secrets OPENAI_API_KEY if available.")
+
+def init_chat_state():
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = [
+            {"role": "system", "content": (
+                "You are a crisp market-intelligence assistant for West African tree crops "
+                "(cashew, shea, cocoa, palm kernel). Be concise, cite assumptions, and suggest "
+                "actionable next steps. If asked to summarize a table, write bullet points."
+            )}
+        ]
+init_chat_state()
 
 # Render prior chat (omit system)
 for m in st.session_state.chat_history:
@@ -762,7 +1013,6 @@ if user_prompt:
     else:
         reply, _streamed = generate_assistant_reply(st.session_state.chat_history)
         if reply:
-            # >>> FIX: if not streamed, render immediately so user sees it now
             if not _streamed:
                 with st.chat_message("assistant"):
                     st.markdown(reply)
@@ -853,198 +1103,7 @@ with st.sidebar:
         ignore_recency = st.checkbox("🕒 Ignore RSS recency check", value=True, key="ignore_recent")
         dedupe_across_sources = st.checkbox("🧹 Deduplicate across sources", value=True, key="dedupe")
 
-# ========================= Processing =========================
-def hash_key(*parts) -> str:
-    return hashlib.md5(("||".join([p or "" for p in parts])).encode("utf-8")).hexdigest()
-
-def process_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
-    if not rows:
-        return pd.DataFrame(columns=["source","published","title","relevance","impact","auto_summary","link","image"])
-    seen = set()
-    cleaned = []
-    for r in rows:
-        key = hash_key(r.get("title",""), r.get("link",""))
-        if key in seen:
-            continue
-        seen.add(key)
-        cleaned.append(r)
-    df = pd.DataFrame(cleaned)
-    if df.empty:
-        return pd.DataFrame(columns=["source","published","title","relevance","impact","auto_summary","link","image"])
-    return df.sort_values("relevance", ascending=False).reset_index(drop=True)
-
-def enrich(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    try:
-        article_text, image_url = fetch_article_text_and_image(entry.get("link",""))
-        base = entry.get("summary") or ""
-        body = article_text if len(article_text) > len(base) else base
-
-        rel = keyword_relevance(" ".join([entry.get("title",""), body]), keywords)
-        if rel < min_relevance:
-            return None
-        summary = simple_extractive_summary(body, n_sentences=n_sent, keywords=keywords)
-        impacts = classify_impact(" ".join([entry.get("title",""), body])) or ["General"]
-
-        return {
-            "source": entry.get("source",""),
-            "title": entry.get("title","(untitled)"),
-            "link": entry.get("link",""),
-            "published": entry.get("published","Date unknown"),
-            "relevance": float(rel),
-            "impact": impacts,
-            "auto_summary": summary,
-            "image": image_url or FALLBACK_IMG,
-        }
-    except Exception as e:
-        soft_fail("Skipped one article that couldn’t be processed.", f"enrich EXC {e}")
-        return None
-
-def fetch_all(chosen_sources: List[str]) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    total_tasks = len(chosen_sources) + (1 if (use_newsdata and newsdata_key) else 0)
-    total_tasks = max(total_tasks, 1)
-    progress = st.progress(0.0)
-    info = st.empty()
-
-    # 1) RSS/Atom
-    for i, src in enumerate(chosen_sources, start=1):
-        info.info(f"Fetching RSS {i}/{total_tasks}: {urlparse(src).netloc}")
-        try:
-            raw_items = fetch_from_feed(src, start_date, end_date, force_fetch, ignore_recency)
-        except Exception as e:
-            soft_fail("Skipped a source due to a transient issue.", f"fetch_from_feed EXC {src}: {e}")
-            raw_items = []
-        if per_source_cap and raw_items:
-            raw_items = raw_items[:per_source_cap]
-
-        if raw_items:
-            with ThreadPoolExecutor(max_workers=6) as ex:
-                futures = [ex.submit(enrich, {**e, "source": urlparse(src).netloc}) for e in raw_items]
-                for fut in as_completed(futures):
-                    try:
-                        r = fut.result()
-                        if r: rows.append(r)
-                    except Exception as e:
-                        soft_fail("One article was skipped during processing.", f"future enrich EXC {e}")
-        progress.progress(min(1.0, i / total_tasks))
-
-    # 2) Newsdata.io
-    if use_newsdata and newsdata_key:
-        info.info(f"Fetching Newsdata.io {len(chosen_sources)+1}/{total_tasks}")
-        try:
-            nd_items = fetch_from_newsdata(
-                api_key=newsdata_key,
-                query=newsdata_query,
-                start_date=start_date,
-                end_date=end_date,
-                language=nd_language or None,
-                country=nd_country or None,
-                category=nd_category or None,
-                max_pages=int(nd_pages),
-            )
-            if per_source_cap and nd_items:
-                nd_items = nd_items[:per_source_cap]
-            if nd_items:
-                with ThreadPoolExecutor(max_workers=6) as ex:
-                    futures = [ex.submit(enrich, it) for it in nd_items]
-                    for fut in as_completed(futures):
-                        try:
-                            r = fut.result()
-                            if r: rows.append(r)
-                        except Exception as e:
-                            soft_fail("One API article was skipped during processing.", f"future API enrich EXC {e}")
-        except Exception as e:
-            soft_fail("The API was briefly unavailable; results shown are from RSS.", f"fetch_from_newsdata EXC {e}")
-        progress.progress(1.0)
-
-    info.empty()
-    progress.empty()
-    return rows
-
-def render_card(row: pd.Series):
-    pub = row["published"]
-    src = row["source"]
-    rel = f"{row['relevance']:.0%}"
-    title = row["title"]
-    link = row["link"]
-    img = row["image"] or FALLBACK_IMG
-    summary = row["auto_summary"] or ""
-    st.markdown(f"""
-    <div class="card">
-      <img class="thumb" src="{img}" alt="thumbnail">
-      <div class="card-body">
-        <div class="meta">{src} · {pub} · Relevance {rel}</div>
-        <div class="title">{title}</div>
-        <div class="badges">
-            {"".join([f'<span class="badge">{t}</span>' for t in row["impact"]])}
-        </div>
-        <div class="summary">{summary}</div>
-        <div style="margin-top:10px;">
-          <a class="link" href="{link}" target="_blank">Read full article →</a>
-        </div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-
-def ui_results(df: pd.DataFrame, top_k: int):
-    st.subheader("📊 Results")
-    if df.empty:
-        st.warning("No relevant articles found. Try widening the date range or lowering the relevance threshold.")
-        return
-
-    c1, c2 = st.columns(2)
-    with c1:
-        all_impacts = sorted({t for tags in df["impact"] for t in tags})
-        impact_filter = st.multiselect("Filter by impact", options=all_impacts, default=[])
-    with c2:
-        source_filter = st.multiselect("Filter by source", options=sorted(df["source"].unique()), default=[])
-
-    filtered = df.copy()
-    if impact_filter:
-        filtered = filtered[filtered["impact"].apply(lambda x: any(t in x for t in impact_filter))]
-    if source_filter:
-        filtered = filtered[filtered["source"].isin(source_filter)]
-
-    st.markdown('<div class="grid">', unsafe_allow_html=True)
-    for _, row in filtered.iterrows():
-        render_card(row)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    st.subheader("📝 Daily Digest")
-    digest_md = make_digest(filtered if (impact_filter or source_filter) else df, top_k=top_k)
-    st.markdown(digest_md)
-
-    st.subheader("⬇️ Downloads")
-    ts = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    export_df = filtered if (impact_filter or source_filter) else df
-    csv_name = f"oneafrica_pulse_{ts}.csv"
-    md_name = f"oneafrica_pulse_digest_{ts}.md"
-    st.download_button("📥 Download CSV", data=export_df.to_csv(index=False).encode("utf-8"),
-                       file_name=csv_name, mime="text/csv")
-    st.download_button("📥 Download Digest (Markdown)", data=digest_md.encode("utf-8"),
-                       file_name=md_name, mime="text/markdown")
-    st.info("💡 Tip: Paste the Markdown into an email, WhatsApp (as a code block), or your wiki for quick sharing.")
-
-def friendly_error_summary():
-    if not SOFT_ERRORS:
-        return
-    counts: Dict[str,int] = {}
-    for m in SOFT_ERRORS:
-        counts[m] = counts.get(m, 0) + 1
-    bullets = "".join([f"- {msg} _(x{n})_\n" for msg, n in counts.items()])
-    st.info(f"""
-**Heads up:** Some sources were temporarily skipped or partially loaded.  
-This doesn’t affect your ability to scan and summarize current items.
-
-{bullets}
-    """)
-
 # ========================= Main =========================
-st.markdown(CARD_CSS, unsafe_allow_html=True)
-
-if 'run_btn' not in locals():
-    run_btn = False  # safety
-
 if not run_btn:
     st.info("""
 **What this demo does:**
@@ -1053,16 +1112,11 @@ if not run_btn:
 - 🎯 Scores relevance against **your commodity & policy keywords**  
 - 📝 Auto-summarizes into 2–6 sentences  
 - 🏷️ Tags each item (Supply Risk, FX & Policy, Logistics, etc.)  
+- 🤖 **AI Analysis**: Get deep insights, opportunities & recommendations for any article
 - 💾 Outputs a **downloadable CSV** and **Daily Digest (Markdown)**
     """)
 else:
     try:
-        if 'chosen_sources' not in locals():
-            chosen_sources = []
-        if 'use_newsdata' not in locals():
-            use_newsdata = False
-        if 'newsdata_key' not in locals():
-            newsdata_key = ""
         if not chosen_sources and not (use_newsdata and newsdata_key):
             st.error("Pick at least one RSS source or enable Newsdata.io (see Configurations).")
         else:
@@ -1075,3 +1129,50 @@ else:
         st.error("We ran into a hiccup assembling the results. Please try again or adjust your filters.")
     finally:
         friendly_error_summary()
+    """
+    if not have_openai():
+        return None
+    
+    client = get_openai_client()
+    if client is None:
+        return None
+    
+    analysis_prompt = f"""Analyze this West African commodity market article and provide:
+
+**Article Title:** {title}
+**Summary:** {summary}
+**Full Content:** {full_text[:4000]}
+
+Please provide a comprehensive analysis covering:
+
+1. **What This Means**: Explain the core message and significance in 2-3 sentences
+2. **Market Impact**: Assess impact on cashew, shea, cocoa, palm kernel markets (price, supply, demand)
+3. **Business Opportunities**: Identify 3-5 specific opportunities for traders, processors, or investors
+4. **Risk Factors**: Highlight potential risks or challenges mentioned or implied
+5. **Actionable Recommendations**: Provide 3-4 concrete next steps
+
+Be specific, cite numbers/facts from the article, and focus on practical business intelligence."""
+
+    messages = [
+        {"role": "system", "content": "You are an expert market analyst for West African agricultural commodities, specializing in cashew, shea, cocoa, and palm kernel markets. Provide actionable intelligence."},
+        {"role": "user", "content": analysis_prompt}
+    ]
+    
+    model_candidates = ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-3.5-turbo-0125"]
+    
+    for model in model_candidates:
+        try:
+            comp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=1500
+            )
+            analysis = (comp.choices[0].message.content or "").strip()
+            if analysis:
+                return analysis
+        except Exception as e:
+            logger.warning(f"Article analysis failed on {model}: {e}")
+            continue
+    
+    return None
