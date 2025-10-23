@@ -181,7 +181,6 @@ CARD_CSS = """
   background: rgba(255,255,255,0.15); color:#fff; font-weight:600; font-size: 13px;
 }
 
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(350px, 1fr)); gap: 16px; }
 .card {
   background: #ffffff;
   border: 1px solid rgba(0,0,0,.06);
@@ -202,11 +201,6 @@ CARD_CSS = """
 
 # ========================= Secrets helpers (no warnings) =========================
 def _get_secret_safely(name: str) -> str:
-    """
-    1) os.environ (works with .env via python-dotenv)
-    2) st.secrets[name] if Secrets are configured
-    Returns "" if missing, without triggering Streamlit's 'No secrets found' banner.
-    """
     val = os.environ.get(name, "")
     if val:
         return str(val).strip().strip('"').strip("'")
@@ -659,7 +653,7 @@ with qa_col1:
 with qa_col2:
     run_quick = st.button("Analyze", use_container_width=True, key="an_quick")
 
-# ======= CHAT ASSISTANT (resilient with fallbacks) =======
+# ======= CHAT ASSISTANT =======
 st.markdown("### 🤖 Chat Assistant")
 st.caption("Ask follow-ups, draft digests, or generate summaries. Uses your `.env`/Secrets OPENAI_API_KEY if available.")
 
@@ -677,20 +671,21 @@ init_chat_state()
 def have_openai():
     return OPENAI_OK and bool(get_openai_api_key())
 
+# ---- Robust client (respects OPENAI_BASE_URL if set) ----
 def get_openai_client():
     try:
-        # If you use the standard OpenAI endpoint, remove base_url arg.
-        # This base_url was in your last version; keeping as-is.
-        return OpenAI(api_key=get_openai_api_key(), base_url="https://models.github.ai/inference")
+        api_key = get_openai_api_key()
+        if not api_key:
+            return None
+        base_url = os.environ.get("OPENAI_BASE_URL", "").strip()
+        if base_url:
+            return OpenAI(api_key=api_key, base_url=base_url)
+        return OpenAI(api_key=api_key)  # official endpoint
     except Exception as e:
         logger.warning(f"OpenAI client init failed: {e}")
         return None
 
 def generate_assistant_reply(messages, temperature: float = 0.4):
-    """
-    Try models in order; stream first, then non-stream fallback.
-    Return (text_or_None, streamed_bool). Never raises to UI.
-    """
     if not have_openai():
         return None, False
     client = get_openai_client()
@@ -706,13 +701,9 @@ def generate_assistant_reply(messages, temperature: float = 0.4):
 
     last_err = None
     for model in model_candidates:
-        # 1) streaming
         try:
             stream = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                stream=True,
-                temperature=temperature,
+                model=model, messages=messages, stream=True, temperature=temperature
             )
             chunks = []
             with st.chat_message("assistant"):
@@ -731,16 +722,12 @@ def generate_assistant_reply(messages, temperature: float = 0.4):
             logger.warning(f"OpenAI streaming failed on {model}: {e}")
             last_err = e
 
-        # 2) non-stream fallback
         try:
             comp = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
+                model=model, messages=messages, temperature=temperature
             )
             reply = (comp.choices[0].message.content or "").strip()
             if reply:
-                # NOTE: We don't render here to avoid double-rendering.
                 return reply, False
         except Exception as e2:
             logger.warning(f"OpenAI non-streaming failed on {model}: {e2}")
@@ -770,7 +757,6 @@ if user_prompt:
     else:
         reply, _streamed = generate_assistant_reply(st.session_state.chat_history)
         if reply:
-            # >>> FIX: if not streamed, render immediately so user sees it now
             if not _streamed:
                 with st.chat_message("assistant"):
                     st.markdown(reply)
@@ -779,16 +765,39 @@ if user_prompt:
             with st.chat_message("assistant"):
                 st.error("The assistant is temporarily unavailable. Please try again in a moment.")
 
+# ========================= Diagnostics =========================
+with st.sidebar:
+    with st.expander("🧪 Diagnostics", expanded=False):
+        st.write("Check your AI setup quickly.")
+        st.write(f"OPENAI package installed: **{OPENAI_OK}**")
+        key_present = "Yes" if get_openai_api_key() else "No"
+        st.write(f"OPENAI_API_KEY present: **{key_present}**")
+        st.write(f"OPENAI_BASE_URL: **{os.environ.get('OPENAI_BASE_URL','(not set)')}**")
+        if st.button("Run AI self-test"):
+            if not have_openai():
+                st.error("No OPENAI_API_KEY or package not installed.")
+            else:
+                client = get_openai_client()
+                if client is None:
+                    st.error("Could not initialize OpenAI client (see logs).")
+                else:
+                    try:
+                        resp = client.chat.completions.create(
+                            model="gpt-4o-mini", temperature=0,
+                            messages=[{"role":"system","content":"You are a tester."},
+                                      {"role":"user","content":"Reply with the single word: OK"}]
+                        )
+                        msg = (resp.choices[0].message.content or "").strip()
+                        st.success(f"LLM replied: {msg[:200]}")
+                    except Exception as e:
+                        st.error(f"Model call failed: {e}")
+
 # ========================= LLM-only Article Analysis =========================
 @st.cache_data(ttl=30*60, show_spinner=False)
 def _llm_analyze_article_cached(model: str, title: str, body: str, tags: List[str]) -> str:
-    """
-    Cached raw text output from the LLM. Cache key includes model+title+body+tags.
-    """
     client = get_openai_client()
     if client is None:
         return ""
-
     prompt = f"""
 You are a market-intelligence analyst focused on West African agri value chains
 (cashew, shea, cocoa, palm kernel), logistics, and FX.
@@ -819,10 +828,8 @@ Constraints:
 - Keep it pragmatic and West-Africa oriented.
 - If information is uncertain, say so explicitly and suggest a verification step.
 """
-
     resp = client.chat.completions.create(
-        model=model,
-        temperature=0.3,
+        model=model, temperature=0.3,
         messages=[
             {"role": "system", "content": "Be precise, actionable, and bias towards decisions and thresholds."},
             {"role": "user", "content": prompt},
@@ -831,19 +838,9 @@ Constraints:
     return (resp.choices[0].message.content or "").strip()
 
 def analyze_with_llm(title: str, body: str, tags: List[str]) -> str:
-    """
-    Try preferred models in order; return the first successful analysis as Markdown text.
-    Pure LLM only (no rule-based fallback).
-    """
     if not have_openai():
         return ""
-
-    model_candidates = [
-        "gpt-4o-mini",
-        "gpt-4o",
-        "gpt-4.1-mini",
-        "gpt-3.5-turbo-0125",
-    ]
+    model_candidates = ["gpt-4o-mini","gpt-4o","gpt-4.1-mini","gpt-3.5-turbo-0125"]
     for m in model_candidates:
         try:
             out = _llm_analyze_article_cached(m, title, body, tags)
@@ -1066,8 +1063,13 @@ def fetch_all(chosen_sources: List[str]) -> List[Dict[str, Any]]:
     progress.empty()
     return rows
 
-# ========================= Card Renderer with LLM-only Analysis =========================
+# ========================= Card Renderer with functional widgets =========================
 def render_card(row: pd.Series):
+    # Stable per-card key & results cache
+    key = f"card_{hash_key(row['title'], row['link'])}"
+    if "ai_analyses" not in st.session_state:
+        st.session_state.ai_analyses = {}
+
     pub = row["published"]
     src = row["source"]
     rel = f"{row['relevance']:.0%}"
@@ -1077,45 +1079,50 @@ def render_card(row: pd.Series):
     summary = row["auto_summary"] or ""
     tags = row["impact"] or ["General"]
 
-    st.markdown(f"""
-    <div class="card">
-      <img class="thumb" src="{img}" alt="thumbnail">
-      <div class="card-body">
-        <div class="meta">{src} · {pub} · Relevance {rel}</div>
-        <div class="title">{title}</div>
-        <div class="badges">
-            {"".join([f'<span class="badge">{t}</span>' for t in tags])}
+    with st.container():
+        # Visual card (HTML ok for layout/branding)
+        st.markdown(f"""
+        <div class="card">
+          <img class="thumb" src="{img}" alt="thumbnail">
+          <div class="card-body">
+            <div class="meta">{src} · {pub} · Relevance {rel}</div>
+            <div class="title">{title}</div>
+            <div class="badges">
+                {"".join([f'<span class="badge">{t}</span>' for t in tags])}
+            </div>
+            <div class="summary">{summary}</div>
+            <div style="margin-top:10px;">
+              <a class="link" href="{link}" target="_blank">Read full article →</a>
+            </div>
+          </div>
         </div>
-        <div class="summary">{summary}</div>
-        <div style="margin-top:10px;">
-          <a class="link" href="{link}" target="_blank">Read full article →</a>
-        </div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
 
-    # Expandable AI analysis section (pure LLM)
-    with st.expander("🔎 Analyze with AI", expanded=False):
-        if not have_openai():
-            st.warning("Add an `OPENAI_API_KEY` to your `.env` or Streamlit Secrets to run AI analysis.")
-            return
+        # Widgets MUST be streamlit-native (not inside raw HTML wrappers)
+        with st.expander("🔎 Analyze with AI", expanded=False):
+            if not have_openai():
+                st.warning("Add an `OPENAI_API_KEY` to your `.env` or Streamlit Secrets to run AI analysis.")
+                st.info("Tip: open the 🧪 Diagnostics panel in the sidebar.")
+                st.stop()
 
-        run_key = f"an_{hash_key(title, link)}"
-        if st.button("Run LLM Analysis", key=run_key):
-            with st.spinner("Analyzing article with AI..."):
-                # Use full fetched text when available; fall back to card summary
-                full_text, _ = fetch_article_text_and_image(link)
-                body = full_text if len(full_text) > len(summary) else summary
+            # Show previous analysis if already computed
+            prev = st.session_state.ai_analyses.get(key)
+            if prev:
+                st.markdown(prev)
 
-                if not body:
-                    st.error("Could not extract article text to analyze.")
-                    return
-
-                md = analyze_with_llm(title, body, tags)
-                if not md:
-                    st.error("AI analysis failed. Please try again.")
-                else:
-                    st.markdown(md)
+            if st.button("Run LLM Analysis", key=f"btn_{key}"):
+                with st.spinner("Analyzing article with AI..."):
+                    full_text, _ = fetch_article_text_and_image(link)
+                    body = full_text if len(full_text) > len(summary) else summary
+                    if not body:
+                        st.error("Could not extract article text to analyze.")
+                    else:
+                        md = analyze_with_llm(title, body, tags)
+                        if not md:
+                            st.error("AI analysis failed. Check Diagnostics and try again.")
+                        else:
+                            st.session_state.ai_analyses[key] = md
+                            st.markdown(md)
 
 def ui_results(df: pd.DataFrame, top_k: int):
     st.subheader("📊 Results")
@@ -1136,10 +1143,16 @@ def ui_results(df: pd.DataFrame, top_k: int):
     if source_filter:
         filtered = filtered[filtered["source"].isin(source_filter)]
 
-    st.markdown('<div class="grid">', unsafe_allow_html=True)
-    for _, row in filtered.iterrows():
-        render_card(row)
-    st.markdown('</div>', unsafe_allow_html=True)
+    # Streamlit-native tiling (no raw <div class="grid"> wrappers around widgets)
+    cards = list(filtered.to_dict("records"))
+    n = 3  # 3 columns
+    for i in range(0, len(cards), n):
+        cols = st.columns(n)
+        for j, col in enumerate(cols):
+            if i + j < len(cards):
+                with col:
+                    render_card(pd.Series(cards[i + j]))
+        st.markdown("<br>", unsafe_allow_html=True)
 
     st.subheader("📝 Daily Digest")
     digest_md = make_digest(filtered if (impact_filter or source_filter) else df, top_k=top_k)
