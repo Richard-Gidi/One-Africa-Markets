@@ -234,6 +234,15 @@ def _normalize(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
+# ---- Session helpers ----
+def ss_get(key, default):
+    if key not in st.session_state:
+        st.session_state[key] = default
+    return st.session_state[key]
+
+def ss_set(key, value):
+    st.session_state[key] = value
+
 # Global soft error bag
 SOFT_ERRORS: List[str] = []
 def soft_fail(msg: str, detail: Optional[str] = None):
@@ -642,7 +651,10 @@ with act_b1:
     run_btn = st.button("🚀 Scan Now", use_container_width=True, key="run_main")
 with act_b2:
     if st.button("♻️ Reset", use_container_width=True, key="reset_main"):
-        st.session_state.clear()
+        # Only clear our app's keys; keep secrets & Streamlit internals intact
+        for k in list(st.session_state.keys()):
+            if k.startswith(("results_", "ai_", "chat_", "cfg_", "last_scan_", "filters_")):
+                del st.session_state[k]
         st.rerun()
 
 # ======= Quick Analyze by URL (LLM-only) =======
@@ -666,7 +678,9 @@ def init_chat_state():
                 "actionable next steps. If asked to summarize a table, write bullet points."
             )}
         ]
-init_chat_state()
+
+if "chat_history" not in st.session_state:
+    init_chat_state()
 
 def have_openai():
     return OPENAI_OK and bool(get_openai_api_key())
@@ -933,6 +947,36 @@ with st.sidebar:
         ignore_recency = st.checkbox("🕒 Ignore RSS recency check", value=True, key="ignore_recent")
         dedupe_across_sources = st.checkbox("🧹 Deduplicate across sources", value=True, key="dedupe")
 
+# Build a single immutable dict of current config (no recompute unless Scan Now)
+current_params = {
+    "chosen_sources": chosen_sources[:],
+    "use_newsdata": bool(use_newsdata),
+    "newsdata_key": newsdata_key,
+    "newsdata_query": newsdata_query,
+    "nd_language": nd_language,
+    "nd_country": nd_country,
+    "nd_category": nd_category,
+    "nd_pages": int(nd_pages),
+    "start_date": start_date,
+    "end_date": end_date,
+    "keywords": keywords[:],
+    "min_relevance": float(min_relevance),
+    "per_source_cap": int(per_source_cap),
+    "n_sent": int(n_sent),
+    "top_k": int(top_k),
+    "force_fetch": bool(force_fetch),
+    "ignore_recency": bool(ignore_recency),
+    "dedupe": bool(dedupe_across_sources),
+}
+
+# ---- Durable stores (persist across reruns) ----
+ss_get("results_df", None)               # pandas.DataFrame or None
+ss_get("results_digest_md", "")          # str
+ss_get("ai_analyses", {})                # dict card_key -> markdown
+ss_get("last_scan_params", {})           # dict of the last run inputs (window, keywords, etc.)
+ss_get("filters_impact", [])             # current impact filter
+ss_get("filters_source", [])             # current source filter
+
 # Quick Analyze trigger (uses LLM only)
 if run_quick:
     if not have_openai():
@@ -975,7 +1019,7 @@ def process_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
         return pd.DataFrame(columns=["source","published","title","relevance","impact","auto_summary","link","image"])
     return df.sort_values("relevance", ascending=False).reset_index(drop=True)
 
-def enrich(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def enrich(entry: Dict[str, Any], keywords: List[str], min_relevance: float, n_sent: int) -> Optional[Dict[str, Any]]:
     try:
         article_text, image_url = fetch_article_text_and_image(entry.get("link",""))
         base = entry.get("summary") or ""
@@ -1001,27 +1045,27 @@ def enrich(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         soft_fail("Skipped one article that couldn’t be processed.", f"enrich EXC {e}")
         return None
 
-def fetch_all(chosen_sources: List[str]) -> List[Dict[str, Any]]:
+def fetch_all(params: Dict[str, Any]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    total_tasks = len(chosen_sources) + (1 if (use_newsdata and newsdata_key) else 0)
+    total_tasks = len(params["chosen_sources"]) + (1 if (params["use_newsdata"] and params["newsdata_key"]) else 0)
     total_tasks = max(total_tasks, 1)
     progress = st.progress(0.0)
     info = st.empty()
 
     # 1) RSS/Atom
-    for i, src in enumerate(chosen_sources, start=1):
+    for i, src in enumerate(params["chosen_sources"], start=1):
         info.info(f"Fetching RSS {i}/{total_tasks}: {urlparse(src).netloc}")
         try:
-            raw_items = fetch_from_feed(src, start_date, end_date, force_fetch, ignore_recency)
+            raw_items = fetch_from_feed(src, params["start_date"], params["end_date"], params["force_fetch"], params["ignore_recency"])
         except Exception as e:
             soft_fail("Skipped a source due to a transient issue.", f"fetch_from_feed EXC {src}: {e}")
             raw_items = []
-        if per_source_cap and raw_items:
-            raw_items = raw_items[:per_source_cap]
+        if params["per_source_cap"] and raw_items:
+            raw_items = raw_items[:params["per_source_cap"]]
 
         if raw_items:
             with ThreadPoolExecutor(max_workers=6) as ex:
-                futures = [ex.submit(enrich, {**e, "source": urlparse(src).netloc}) for e in raw_items]
+                futures = [ex.submit(enrich, {**e, "source": urlparse(src).netloc}, params["keywords"], params["min_relevance"], params["n_sent"]) for e in raw_items]
                 for fut in as_completed(futures):
                     try:
                         r = fut.result()
@@ -1031,24 +1075,24 @@ def fetch_all(chosen_sources: List[str]) -> List[Dict[str, Any]]:
         progress.progress(min(1.0, i / total_tasks))
 
     # 2) Newsdata.io
-    if use_newsdata and newsdata_key:
-        info.info(f"Fetching Newsdata.io {len(chosen_sources)+1}/{total_tasks}")
+    if params["use_newsdata"] and params["newsdata_key"]:
+        info.info(f"Fetching Newsdata.io {len(params['chosen_sources'])+1}/{total_tasks}")
         try:
             nd_items = fetch_from_newsdata(
-                api_key=newsdata_key,
-                query=newsdata_query,
-                start_date=start_date,
-                end_date=end_date,
-                language=nd_language or None,
-                country=nd_country or None,
-                category=nd_category or None,
-                max_pages=int(nd_pages),
+                api_key=params["newsdata_key"],
+                query=params["newsdata_query"],
+                start_date=params["start_date"],
+                end_date=params["end_date"],
+                language=params["nd_language"] or None,
+                country=params["nd_country"] or None,
+                category=params["nd_category"] or None,
+                max_pages=int(params["nd_pages"]),
             )
-            if per_source_cap and nd_items:
-                nd_items = nd_items[:per_source_cap]
+            if params["per_source_cap"] and nd_items:
+                nd_items = nd_items[:params["per_source_cap"]]
             if nd_items:
                 with ThreadPoolExecutor(max_workers=6) as ex:
-                    futures = [ex.submit(enrich, it) for it in nd_items]
+                    futures = [ex.submit(enrich, it, params["keywords"], params["min_relevance"], params["n_sent"]) for it in nd_items]
                     for fut in as_completed(futures):
                         try:
                             r = fut.result()
@@ -1061,6 +1105,19 @@ def fetch_all(chosen_sources: List[str]) -> List[Dict[str, Any]]:
 
     info.empty()
     progress.empty()
+
+    # Optional cross-source de-duplication (already deduped by title+link, but keep option)
+    if params.get("dedupe", True) and rows:
+        seen = set()
+        deduped = []
+        for r in rows:
+            k = hash_key(r["title"], r["link"])
+            if k in seen:
+                continue
+            seen.add(k)
+            deduped.append(r)
+        rows = deduped
+
     return rows
 
 # ========================= Card Renderer with functional widgets =========================
@@ -1080,7 +1137,7 @@ def render_card(row: pd.Series):
     tags = row["impact"] or ["General"]
 
     with st.container():
-        # Visual card (HTML ok for layout/branding)
+        # Visual card
         st.markdown(f"""
         <div class="card">
           <img class="thumb" src="{img}" alt="thumbnail">
@@ -1121,7 +1178,7 @@ def render_card(row: pd.Series):
                         if not md:
                             st.error("AI analysis failed. Check Diagnostics and try again.")
                         else:
-                            st.session_state.ai_analyses[key] = md
+                            st.session_state["ai_analyses"][key] = md
                             st.markdown(md)
 
 def ui_results(df: pd.DataFrame, top_k: int):
@@ -1133,9 +1190,19 @@ def ui_results(df: pd.DataFrame, top_k: int):
     c1, c2 = st.columns(2)
     with c1:
         all_impacts = sorted({t for tags in df["impact"] for t in tags})
-        impact_filter = st.multiselect("Filter by impact", options=all_impacts, default=[])
+        impact_filter = st.multiselect(
+            "Filter by impact",
+            options=all_impacts,
+            default=ss_get("filters_impact", []),
+            key="filters_impact"
+        )
     with c2:
-        source_filter = st.multiselect("Filter by source", options=sorted(df["source"].unique()), default=[])
+        source_filter = st.multiselect(
+            "Filter by source",
+            options=sorted(df["source"].unique()),
+            default=ss_get("filters_source", []),
+            key="filters_source"
+        )
 
     filtered = df.copy()
     if impact_filter:
@@ -1143,7 +1210,7 @@ def ui_results(df: pd.DataFrame, top_k: int):
     if source_filter:
         filtered = filtered[filtered["source"].isin(source_filter)]
 
-    # Streamlit-native tiling (no raw <div class="grid"> wrappers around widgets)
+    # Streamlit-native tiling
     cards = list(filtered.to_dict("records"))
     n = 3  # 3 columns
     for i in range(0, len(cards), n):
@@ -1183,13 +1250,38 @@ This doesn’t affect your ability to scan and summarize current items.
 {bullets}
     """)
 
-# ========================= Main =========================
+# ========================= Main (stable, button-gated) =========================
 st.markdown(CARD_CSS, unsafe_allow_html=True)
 
 if 'run_btn' not in locals():
     run_btn = False  # safety
 
-if not run_btn:
+if run_btn:
+    # You explicitly asked to scan now → do the work and persist it
+    try:
+        if not current_params["chosen_sources"] and not (current_params["use_newsdata"] and current_params["newsdata_key"]):
+            st.error("Pick at least one RSS source or enable Newsdata.io (see Configurations).")
+        else:
+            with st.spinner("Scanning sources, extracting content, and generating summaries..."):
+                rows = fetch_all(current_params)
+                df = process_rows(rows)
+
+                # Persist results so they survive reruns
+                st.session_state["results_df"] = df
+                st.session_state["results_digest_md"] = make_digest(df, top_k=current_params["top_k"])
+                st.session_state["last_scan_params"] = current_params
+
+    except Exception as e:
+        soft_fail("Something went wrong while assembling the results.", f"MAIN EXC {e}")
+        st.error("We ran into a hiccup assembling the results. Please try again or adjust your filters.")
+    finally:
+        friendly_error_summary()
+
+# Render either the newly saved results or the last good results
+df = st.session_state.get("results_df", None)
+digest_md = st.session_state.get("results_digest_md", "")
+
+if df is None:
     st.info("""
 **What this demo does:**
 - 📰 Scans curated RSS/Atom feeds (+ optional Newsdata.io API) for the last *N* days  
@@ -1200,22 +1292,5 @@ if not run_btn:
 - 💾 Outputs a **downloadable CSV** and **Daily Digest (Markdown)**
     """)
 else:
-    try:
-        if 'chosen_sources' not in locals():
-            chosen_sources = []
-        if 'use_newsdata' not in locals():
-            use_newsdata = False
-        if 'newsdata_key' not in locals():
-            newsdata_key = ""
-        if not chosen_sources and not (use_newsdata and newsdata_key):
-            st.error("Pick at least one RSS source or enable Newsdata.io (see Configurations).")
-        else:
-            with st.spinner("Scanning sources, extracting content, and generating summaries..."):
-                rows = fetch_all(chosen_sources)
-                df = process_rows(rows)
-                ui_results(df, top_k)
-    except Exception as e:
-        soft_fail("Something went wrong while assembling the results.", f"MAIN EXC {e}")
-        st.error("We ran into a hiccup assembling the results. Please try again or adjust your filters.")
-    finally:
-        friendly_error_summary()
+    # Use the stored results; do NOT recompute unless Scan Now was clicked
+    ui_results(df, top_k=st.session_state.get("last_scan_params", {}).get("top_k", 12))
