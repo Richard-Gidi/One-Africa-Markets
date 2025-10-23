@@ -21,6 +21,7 @@ from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 import xml.etree.ElementTree as ET
 import logging
+from dataclasses import dataclass
 
 # ==== resilient .env loader ====
 try:
@@ -60,7 +61,7 @@ except Exception:
 # ========================= App Strings / Theme =========================
 APP_NAME = "One Africa Market Pulse"
 TAGLINE = "Automated intelligence for cashew, shea, cocoa & allied markets."
-QUOTE = ""Ask your data why, until it has nothing else to say." — Richard Gidi"
+QUOTE = "“Ask your data why, until it has nothing else to say.” — Richard Gidi"
 
 # Fallback image for articles with no thumbnail
 FALLBACK_IMG = "https://images.unsplash.com/photo-1519681393784-d120267933ba?q=80&w=1200&auto=format&fit=crop"
@@ -69,7 +70,7 @@ DEFAULT_KEYWORDS = [
     "cashew", "shea", "shea nut", "cocoa", "palm kernel", "agri", "export", "harvest",
     "shipment", "freight", "logistics", "port", "tariff", "ban", "fx", "currency",
     "cedi", "naira", "inflation", "subsidy", "cooperative", "value-addition", "processing",
-    "ghana", "nigeria", "cote d'ivoire", "ivory coast", "benin", "togo", "burkina",
+    "ghana", "nigeria", "cote d’ivoire", "ivory coast", "benin", "togo", "burkina",
     "west africa", "sahel", "trade policy", "commodity", "price", "market"
 ]
 
@@ -159,6 +160,23 @@ IMPACT_RULES = {
         r"\b(?:research|development|r&d)\b",
         r"\b(?:startup|fintech|agtech)\b",
     ],
+}
+
+# ========= Extra vocab for heuristics (used elsewhere, harmless here even for LLM-only) =========
+COMMODITY_TERMS = {
+    "cashew": ["cashew", "rcn", "raw cashew", "cashew kernel"],
+    "shea": ["shea", "shea nut", "shea butter", "karite"],
+    "cocoa": ["cocoa", "cocoa bean", "cocobod", "grinder", "chocolate"],
+    "palm": ["palm", "palm kernel", "pko", "palm oil", "cpo", "olein", "stearin"],
+}
+REGION_TERMS = {
+    "Ghana": ["ghana", "accra", "tema", "takoradi"],
+    "Nigeria": ["nigeria", "lagos", "apapa", "tin can", "onitsha"],
+    "Côte d’Ivoire": ["côte d’ivoire", "ivory coast", "abidjan", "san pedro"],
+    "Benin": ["benin", "cotonou"],
+    "Togo": ["togo", "lomé", "lome"],
+    "Burkina Faso": ["burkina", "ouagadougou", "bobo-dioulasso"],
+    "West Africa (General)": ["west africa", "sahel", "ecowas"]
 }
 
 # ========================= Streamlit UI CSS =========================
@@ -259,7 +277,7 @@ def fetch_page(url: str, timeout: int = 12) -> str:
         }
         r = get_session().get(url, headers=headers, timeout=timeout)
         if r.status_code != 200:
-            soft_fail("Skipped a page that didn't load cleanly.", f"fetch_page {url} -> {r.status_code}")
+            soft_fail("Skipped a page that didn’t load cleanly.", f"fetch_page {url} -> {r.status_code}")
             return ""
         return r.text
     except Exception as e:
@@ -609,29 +627,84 @@ def fetch_from_newsdata(
             continue
     return items
 
-# ========================= AI Analysis Functions =========================
+# ========================= UI Helpers =========================
+st.set_page_config(page_title=APP_NAME, page_icon="🌍", layout="wide", initial_sidebar_state="expanded")
+st.markdown(CARD_CSS, unsafe_allow_html=True)
+
+def make_digest(df: pd.DataFrame, top_k: int = 12) -> str:
+    header = f"# {APP_NAME} — Daily Digest\n\n*{TAGLINE}*\n\n> {QUOTE}\n\n"
+    if df.empty:
+        return header + "_No relevant items found for the selected period._"
+    parts = [header, f"**Date:** {dt.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"]
+    for _, row in df.head(top_k).iterrows():
+        impact = ", ".join(row["impact"])
+        parts.append(
+            f"### {row['title']}\n"
+            f"- **Source:** {row['source']}  \n"
+            f"- **Published:** {row['published']}  \n"
+            f"- **Relevance:** {row['relevance']:.3f}  \n"
+            f"- **Impact:** {impact}  \n"
+            f"- **Summary:** {row['auto_summary']}\n"
+            f"[Read more]({row['link']})\n\n---\n"
+        )
+    return "\n".join(parts)
+
+# ======= HERO =======
+with st.container():
+    st.markdown(f"""
+    <div class="hero">
+        <div class="pill">🌍 One Africa Market Pulse</div>
+        <h1>{TAGLINE}</h1>
+        <p>{QUOTE}</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+# ======= ACTION BAR =======
+st.markdown("<br>", unsafe_allow_html=True)
+act_b1, act_b2 = st.columns([1, 1])
+with act_b1:
+    run_btn = st.button("🚀 Scan Now", use_container_width=True, key="run_main")
+with act_b2:
+    if st.button("♻️ Reset", use_container_width=True, key="reset_main"):
+        st.session_state.clear()
+        st.rerun()
+
+# ======= QUICK LLM ANALYZE BY URL (pure LLM) =======
+st.markdown("### 🔗 Quick Analyze by URL (LLM)")
+url_col, btn_col = st.columns([4,1])
+with url_col:
+    quick_url = st.text_input("Paste any article URL", value="", placeholder="https://example.com/article")
+with btn_col:
+    run_quick = st.button("Analyze", use_container_width=True, key="an_quick")
+
+# ======= CHAT ASSISTANT (resilient with fallbacks) =======
+st.markdown("### 🤖 Chat Assistant")
+st.caption("Ask follow-ups, draft digests, or generate summaries. Uses your `.env`/Secrets OPENAI_API_KEY if available.")
+
+def init_chat_state():
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = [
+            {"role": "system", "content": (
+                "You are a crisp market-intelligence assistant for West African tree crops "
+                "(cashew, shea, cocoa, palm kernel). Be concise, cite assumptions, and suggest "
+                "actionable next steps. If asked to summarize a table, write bullet points."
+            )}
+        ]
+init_chat_state()
+
 def have_openai():
     return OPENAI_OK and bool(get_openai_api_key())
 
 def get_openai_client():
     try:
-        return OpenAI(api_key=get_openai_api_key())
+        # If you use the standard OpenAI endpoint, remove base_url arg.
+        # Kept here to match your prior setup.
+        return OpenAI(api_key=get_openai_api_key(), base_url="https://models.github.ai/inference")
     except Exception as e:
         logger.warning(f"OpenAI client init failed: {e}")
         return None
 
-def analyze_article_with_ai(title: str, summary: str, full_text: str, link: str) -> Optional[str]:
-    """
-    Uses OpenAI to provide deep analysis of an article including:
-    - Meaning & key insights
-    - Market impact
-    - Business opportunities
-    - Risk factors
 def generate_assistant_reply(messages, temperature: float = 0.4):
-    """
-    Try models in order; stream first, then non-stream fallback.
-    Return (text_or_None, streamed_bool). Never raises to UI.
-    """
     if not have_openai():
         return None, False
     client = get_openai_client()
@@ -681,6 +754,8 @@ def generate_assistant_reply(messages, temperature: float = 0.4):
             )
             reply = (comp.choices[0].message.content or "").strip()
             if reply:
+                if not _:
+                    pass
                 return reply, False
         except Exception as e2:
             logger.warning(f"OpenAI non-streaming failed on {model}: {e2}")
@@ -690,83 +765,111 @@ def generate_assistant_reply(messages, temperature: float = 0.4):
     soft_fail("Assistant is temporarily unavailable.", f"OpenAI failures: {last_err}")
     return None, False
 
-# ========================= UI Helpers =========================
+# Render prior chat (omit system)
+for m in st.session_state.chat_history:
+    if m["role"] == "system":
+        continue
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+
+# Chat input
+user_prompt = st.chat_input("Type your message...")
+if user_prompt:
+    st.session_state.chat_history.append({"role": "user", "content": user_prompt})
+    with st.chat_message("user"):
+        st.markdown(user_prompt)
+
+    if not have_openai():
+        with st.chat_message("assistant"):
+            st.warning("No `OPENAI_API_KEY` found (in `.env` or Streamlit Secrets). Add it and press **Reset**.")
+    else:
+        reply, _streamed = generate_assistant_reply(st.session_state.chat_history)
+        if reply:
+            if not _streamed:
+                with st.chat_message("assistant"):
+                    st.markdown(reply)
+            st.session_state.chat_history.append({"role": "assistant", "content": reply})
+        else:
+            with st.chat_message("assistant"):
+                st.error("The assistant is temporarily unavailable. Please try again in a moment.")
+
+# ========================= LLM-ONLY ARTICLE ANALYSIS ENGINE =========================
+@st.cache_data(ttl=30*60, show_spinner=False)
+def _llm_analyze_article_cached(model: str, title: str, body: str, tags: List[str]) -> str:
+    """
+    Cached raw text output from the LLM. Cache key includes model+title+body+tags.
+    """
+    client = get_openai_client()
+    if client is None:
+        return ""
+
+    prompt = f"""
+You are a market-intelligence analyst focused on West African agri value chains
+(cashew, shea, cocoa, palm kernel), logistics, and FX.
+
+Analyze the ARTICLE and produce a concise, executive-ready brief. Use short, punchy bullets
+where appropriate and provide concrete, actionable guidance. Avoid fluff.
+
+ARTICLE TITLE:
+{title[:400]}
+
+ARTICLE BODY (may be partial):
+{body[:7000]}
+
+HEURISTIC TAGS PROVIDED BY UI (may be incomplete):
+{", ".join(tags) if tags else "General"}
+
+Return your analysis in EXACTLY these sections with clear headings:
+1) WHAT THE ARTICLE MEANS — 2–3 sentence synthesis
+2) KEY INSIGHTS — 3–6 bullets with the most important takeaways
+3) MARKET IMPACT — specific effects on supply/demand, prices, logistics, FX; note direction & magnitude if possible
+4) BUSINESS OPPORTUNITIES — 3–6 concrete moves we could make now (be specific)
+5) RISK FACTORS — 3–5 concise bullets (operational, financial/FX, regulatory)
+6) ACTIONABLE RECOMMENDATIONS — 3–5 steps with owners or thresholds where relevant
+7) TIME HORIZON — near-term (0–3m) / medium (3–12m) / long (12m+)
+8) CONFIDENCE — High/Medium/Low and why
+
+Constraints:
+- Keep it pragmatic and West-Africa oriented.
+- If information is uncertain, say so explicitly and suggest a verification step.
+"""
+
+    resp = client.chat.completions.create(
+        model=model,
+        temperature=0.3,
+        messages=[
+            {"role": "system", "content": "Be precise, actionable, and bias towards decisions and thresholds."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+def analyze_with_llm(title: str, body: str, tags: List[str]) -> str:
+    """
+    Try preferred models in order; return the first successful analysis as Markdown text.
+    """
+    if not have_openai():
+        return ""
+
+    model_candidates = [
+        "gpt-4o-mini",
+        "gpt-4o",
+        "gpt-4.1-mini",
+        "gpt-3.5-turbo-0125",
+    ]
+    for m in model_candidates:
+        try:
+            out = _llm_analyze_article_cached(m, title, body, tags)
+            if out:
+                return out
+        except Exception as e:
+            logger.warning(f"LLM analyze failed on {m}: {e}")
+            continue
+    return ""
+
+# ========================= Processing =========================
 def hash_key(*parts) -> str:
     return hashlib.md5(("||".join([p or "" for p in parts])).encode("utf-8")).hexdigest()
-
-def make_digest(df: pd.DataFrame, top_k: int = 12) -> str:
-    header = f"# {APP_NAME} — Daily Digest\n\n*{TAGLINE}*\n\n> {QUOTE}\n\n"
-    if df.empty:
-        return header + "_No relevant items found for the selected period._"
-    parts = [header, f"**Date:** {dt.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"]
-    for _, row in df.head(top_k).iterrows():
-        impact = ", ".join(row["impact"])
-        parts.append(
-            f"### {row['title']}\n"
-            f"- **Source:** {row['source']}  \n"
-            f"- **Published:** {row['published']}  \n"
-            f"- **Relevance:** {row['relevance']:.3f}  \n"
-            f"- **Impact:** {impact}  \n"
-            f"- **Summary:** {row['auto_summary']}\n"
-            f"[Read more]({row['link']})\n\n---\n"
-        )
-    return "\n".join(parts)
-
-def render_card(row: pd.Series):
-    pub = row["published"]
-    src = row["source"]
-    rel = f"{row['relevance']:.0%}"
-    title = row["title"]
-    link = row["link"]
-    img = row["image"] or FALLBACK_IMG
-    summary = row["auto_summary"] or ""
-    
-    # Create unique key for this article
-    article_key = hash_key(title, link)
-    
-    badges_html = "".join([f'<span class="badge">{t}</span>' for t in row["impact"]])
-    
-    st.markdown(f"""
-    <div class="card">
-      <img class="thumb" src="{img}" alt="thumbnail">
-      <div class="card-body">
-        <div class="meta">{src} &middot; {pub} &middot; Relevance {rel}</div>
-        <div class="title">{title}</div>
-        <div class="badges">
-            {badges_html}
-        </div>
-        <div class="summary">{summary}</div>
-        <div style="margin-top:10px;">
-          <a class="link" href="{link}" target="_blank">Read full article &rarr;</a>
-        </div>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
-    
-    # AI Analysis Section
-    if have_openai():
-        with st.container():
-            col1, col2 = st.columns([1, 4])
-            with col1:
-                analyze_btn = st.button("🤖 AI Analysis", key=f"analyze_{article_key}", use_container_width=True)
-            with col2:
-                st.caption("Get deep insights, opportunities & recommendations")
-            
-            if analyze_btn:
-                with st.spinner("Analyzing article with AI..."):
-                    # Fetch full article text if not already in row
-                    full_text = row.get("full_text", "")
-                    if not full_text:
-                        full_text, _ = fetch_article_text_and_image(link)
-                    
-                    analysis = analyze_article_with_ai(title, summary, full_text, link)
-                    
-                    if analysis:
-                        with st.expander("📊 AI Analysis Results", expanded=True):
-                            st.markdown(analysis)
-                            st.caption(f"Analysis generated for: {title}")
-                    else:
-                        st.error("AI analysis temporarily unavailable. Please try again.")
 
 def process_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     if not rows:
@@ -790,6 +893,7 @@ def enrich(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         base = entry.get("summary") or ""
         body = article_text if len(article_text) > len(base) else base
 
+        # Note: relevance uses DEFAULT_KEYWORDS provided by user via sidebar later
         rel = keyword_relevance(" ".join([entry.get("title",""), body]), keywords)
         if rel < min_relevance:
             return None
@@ -807,7 +911,7 @@ def enrich(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "image": image_url or FALLBACK_IMG,
         }
     except Exception as e:
-        soft_fail("Skipped one article that couldn't be processed.", f"enrich EXC {e}")
+        soft_fail("Skipped one article that couldn’t be processed.", f"enrich EXC {e}")
         return None
 
 def fetch_all(chosen_sources: List[str]) -> List[Dict[str, Any]]:
@@ -872,6 +976,58 @@ def fetch_all(chosen_sources: List[str]) -> List[Dict[str, Any]]:
     progress.empty()
     return rows
 
+# ========================= LLM-INTEGRATED CARD RENDERER (PURE LLM) =========================
+def render_card(row: pd.Series):
+    pub = row["published"]
+    src = row["source"]
+    rel = f"{row['relevance']:.0%}"
+    title = row["title"]
+    link = row["link"]
+    img = row["image"] or FALLBACK_IMG
+    summary = row["auto_summary"] or ""
+    tags = row["impact"] or ["General"]
+
+    st.markdown(f"""
+    <div class="card">
+      <img class="thumb" src="{img}" alt="thumbnail">
+      <div class="card-body">
+        <div class="meta">{src} · {pub} · Relevance {rel}</div>
+        <div class="title">{title}</div>
+        <div class="badges">
+            {"".join([f'<span class="badge">{t}</span>' for t in tags])}
+        </div>
+        <div class="summary">{summary}</div>
+        <div style="margin-top:10px;">
+          <a class="link" href="{link}" target="_blank">Read full article →</a>
+        </div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Expandable AI analysis section (pure LLM)
+    with st.expander("🔎 Analyze with AI", expanded=False):
+        if not have_openai():
+            st.warning("Add an `OPENAI_API_KEY` to your `.env` or Streamlit Secrets to run AI analysis.")
+            return
+
+        run_key = f"an_{hash_key(title, link)}"
+        if st.button("Run LLM Analysis", key=run_key):
+            with st.spinner("Analyzing article with AI..."):
+                # Use full fetched text when available; fall back to card summary
+                full_text, _ = fetch_article_text_and_image(link)
+                body = full_text if len(full_text) > len(summary) else summary
+
+                if not body:
+                    st.error("Could not extract article text to analyze.")
+                    return
+
+                md = analyze_with_llm(title, body, tags)
+                if not md:
+                    st.error("AI analysis failed. Please try again.")
+                else:
+                    st.markdown(md)
+
+# ========================= RESULTS UI =========================
 def ui_results(df: pd.DataFrame, top_k: int):
     st.subheader("📊 Results")
     if df.empty:
@@ -905,41 +1061,10 @@ def ui_results(df: pd.DataFrame, top_k: int):
     export_df = filtered if (impact_filter or source_filter) else df
     csv_name = f"oneafrica_pulse_{ts}.csv"
     md_name = f"oneafrica_pulse_digest_{ts}.md"
-    
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.download_button("📥 Download CSV", data=export_df.to_csv(index=False).encode("utf-8"),
-                           file_name=csv_name, mime="text/csv")
-    with col2:
-        st.download_button("📥 Download Digest (Markdown)", data=digest_md.encode("utf-8"),
-                           file_name=md_name, mime="text/markdown")
-    with col3:
-        if have_openai() and not export_df.empty:
-            num_to_analyze = min(5, len(export_df))
-            if st.button(f"🤖 Batch Analyze Top {num_to_analyze}", key="batch_analyze"):
-                with st.spinner(f"Analyzing top {num_to_analyze} articles..."):
-                    analyses = []
-                    for idx, row in export_df.head(num_to_analyze).iterrows():
-                        full_text, _ = fetch_article_text_and_image(row["link"])
-                        analysis = analyze_article_with_ai(
-                            row["title"], 
-                            row["auto_summary"], 
-                            full_text, 
-                            row["link"]
-                        )
-                        if analysis:
-                            analyses.append(f"## {row['title']}\n\n{analysis}\n\n---\n")
-                    
-                    if analyses:
-                        batch_report = "\n".join(analyses)
-                        st.download_button(
-                            "📥 Download Batch Analysis Report",
-                            data=batch_report.encode("utf-8"),
-                            file_name=f"oneafrica_ai_analysis_{ts}.md",
-                            mime="text/markdown"
-                        )
-                        st.success(f"✅ Analyzed {len(analyses)} articles!")
-    
+    st.download_button("📥 Download CSV", data=export_df.to_csv(index=False).encode("utf-8"),
+                       file_name=csv_name, mime="text/csv")
+    st.download_button("📥 Download Digest (Markdown)", data=digest_md.encode("utf-8"),
+                       file_name=md_name, mime="text/markdown")
     st.info("💡 Tip: Paste the Markdown into an email, WhatsApp (as a code block), or your wiki for quick sharing.")
 
 def friendly_error_summary():
@@ -951,79 +1076,12 @@ def friendly_error_summary():
     bullets = "".join([f"- {msg} _(x{n})_\n" for msg, n in counts.items()])
     st.info(f"""
 **Heads up:** Some sources were temporarily skipped or partially loaded.  
-This doesnt affect your ability to scan and summarize current items.
+This doesn’t affect your ability to scan and summarize current items.
 
 {bullets}
     """)
 
-# ========================= Streamlit App Setup =========================
-st.set_page_config(page_title=APP_NAME, page_icon="🌍", layout="wide", initial_sidebar_state="expanded")
-st.markdown(CARD_CSS, unsafe_allow_html=True)
-
-# ======= HERO =======
-with st.container():
-    st.markdown(f"""
-    <div class="hero">
-        <div class="pill">🌍 One Africa Market Pulse</div>
-        <h1>{TAGLINE}</h1>
-        <p>{QUOTE}</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-# ======= ACTION BAR =======
-st.markdown("<br>", unsafe_allow_html=True)
-act_b1, act_b2 = st.columns([1, 1])
-with act_b1:
-    run_btn = st.button("🚀 Scan Now", use_container_width=True, key="run_main")
-with act_b2:
-    if st.button("♻️ Reset", use_container_width=True, key="reset_main"):
-        st.session_state.clear()
-        st.rerun()
-
-# ======= CHAT ASSISTANT (resilient with fallbacks) =======
-st.markdown("### 🤖 Chat Assistant")
-st.caption("Ask follow-ups, draft digests, or generate summaries. Uses your `.env`/Secrets OPENAI_API_KEY if available.")
-
-def init_chat_state():
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = [
-            {"role": "system", "content": (
-                "You are a crisp market-intelligence assistant for West African tree crops "
-                "(cashew, shea, cocoa, palm kernel). Be concise, cite assumptions, and suggest "
-                "actionable next steps. If asked to summarize a table, write bullet points."
-            )}
-        ]
-init_chat_state()
-
-# Render prior chat (omit system)
-for m in st.session_state.chat_history:
-    if m["role"] == "system":
-        continue
-    with st.chat_message(m["role"]):
-        st.markdown(m["content"])
-
-# Chat input
-user_prompt = st.chat_input("Type your message...")
-if user_prompt:
-    st.session_state.chat_history.append({"role": "user", "content": user_prompt})
-    with st.chat_message("user"):
-        st.markdown(user_prompt)
-
-    if not have_openai():
-        with st.chat_message("assistant"):
-            st.warning("No `OPENAI_API_KEY` found (in `.env` or Streamlit Secrets). Add it and press **Reset**.")
-    else:
-        reply, _streamed = generate_assistant_reply(st.session_state.chat_history)
-        if reply:
-            if not _streamed:
-                with st.chat_message("assistant"):
-                    st.markdown(reply)
-            st.session_state.chat_history.append({"role": "assistant", "content": reply})
-        else:
-            with st.chat_message("assistant"):
-                st.error("The assistant is temporarily unavailable. Please try again in a moment.")
-
-# ========================= SINGLE COLLAPSIBLE CONFIG PANEL =========================
+# ========================= Sidebar Config =========================
 with st.sidebar:
     with st.expander("⚙️ Configurations", expanded=False):
         st.header("Settings")
@@ -1041,140 +1099,4 @@ with st.sidebar:
 
         st.markdown("---")
 
-        # 🧩 Newsdata.io (optional)
-        st.subheader("🧩 Newsdata.io (optional)")
-        st.caption("Merge API headlines with the same scoring & summaries.")
-        use_newsdata = st.checkbox("Use Newsdata.io", value=True, key="use_nd")
-
-        auto_key = get_newsdata_api_key()
-        override = st.checkbox("Temporarily override API key (not saved)", value=False, key="nd_override")
-        tmp_key = st.text_input("Enter API key", type="password", key="nd_key_input") if override else ""
-        newsdata_key = (tmp_key or auto_key).strip()
-
-        if use_newsdata:
-            if newsdata_key:
-                st.success("Using secured API key.")
-            else:
-                st.warning("No API key found. Add NEWSDATA_API_KEY to `.env`/Secrets, or use a temporary override.")
-
-        newsdata_query = st.text_input("Query", value="tree crop commodities", key="nd_query")
-        c1, c2, c3 = st.columns(3)
-        with c1: nd_language = st.text_input("Language (e.g., en, fr)", value="", key="nd_lang")
-        with c2: nd_country = st.text_input("Country (e.g., gh, ng, ci)", value="", key="nd_cty")
-        with c3: nd_category = st.text_input("Category (e.g., business)", value="", key="nd_cat")
-        nd_pages = st.number_input("Newsdata pages", min_value=1, max_value=10, value=2, step=1, key="nd_pages")
-
-        st.markdown("---")
-
-        # 📅 Date Range
-        st.subheader("📅 Date Range")
-        mode = st.radio("Mode", ["Quick Select", "Custom"], horizontal=True, key="date_mode")
-        if mode == "Quick Select":
-            quick = {"Last 24 Hours": 1, "Last 3 Days": 3, "Last Week": 7, "Last 2 Weeks": 14, "Last Month": 30}
-            sel = st.selectbox("Window", list(quick.keys()), index=2, key="date_win")
-            end_date = dt.datetime.now(dt.timezone.utc)
-            start_date = end_date - dt.timedelta(days=quick[sel])
-        else:
-            d1, d2 = st.columns(2)
-            with d1: sd = st.date_input("Start", value=dt.date.today() - dt.timedelta(days=7), key="start_date")
-            with d2: ed = st.date_input("End", value=dt.date.today(), key="end_date")
-            start_date = dt.datetime.combine(sd, dt.time.min, tzinfo=dt.timezone.utc)
-            end_date = dt.datetime.combine(ed, dt.time.max, tzinfo=dt.timezone.utc)
-
-        st.markdown("---")
-
-        # 🔍 Keywords & Filters
-        st.subheader("🔍 Keywords & Filters")
-        custom_kw = st.text_area("Keywords (comma-separated)", ", ".join(DEFAULT_KEYWORDS), height=100, key="kw_text")
-        keywords = [k.strip() for k in custom_kw.split(",") if k.strip()]
-        min_relevance = st.number_input("Min relevance (0.00–1.00)", min_value=0.0, max_value=1.0, value=0.05, step=0.01, format="%.2f", key="min_rel")
-        per_source_cap = st.number_input("Max articles per source", min_value=1, max_value=200, value=20, step=1, key="cap")
-
-        st.markdown("---")
-
-        # 📝 Content Settings
-        st.subheader("📝 Content Settings")
-        n_sent = st.number_input("Sentences per summary", min_value=2, max_value=10, value=3, step=1, key="n_sent")
-        top_k = st.number_input("Digest: top items", min_value=5, max_value=100, value=12, step=1, key="top_k")
-
-        st.markdown("---")
-
-        # 🛡️ Resilience
-        st.subheader("🛡️ Resilience")
-        force_fetch = st.checkbox("⚡ Force RSS fetch if validation fails", value=True, key="force")
-        ignore_recency = st.checkbox("🕒 Ignore RSS recency check", value=True, key="ignore_recent")
-        dedupe_across_sources = st.checkbox("🧹 Deduplicate across sources", value=True, key="dedupe")
-
-# ========================= Main =========================
-if not run_btn:
-    st.info("""
-**What this demo does:**
-- 📰 Scans curated RSS/Atom feeds (+ optional Newsdata.io API) for the last *N* days  
-- 📑 Fetches full article text where possible + **thumbnails** (Open Graph)  
-- 🎯 Scores relevance against **your commodity & policy keywords**  
-- 📝 Auto-summarizes into 2–6 sentences  
-- 🏷️ Tags each item (Supply Risk, FX & Policy, Logistics, etc.)  
-- 🤖 **AI Analysis**: Get deep insights, opportunities & recommendations for any article
-- 💾 Outputs a **downloadable CSV** and **Daily Digest (Markdown)**
-    """)
-else:
-    try:
-        if not chosen_sources and not (use_newsdata and newsdata_key):
-            st.error("Pick at least one RSS source or enable Newsdata.io (see Configurations).")
-        else:
-            with st.spinner("Scanning sources, extracting content, and generating summaries..."):
-                rows = fetch_all(chosen_sources)
-                df = process_rows(rows)
-                ui_results(df, top_k)
-    except Exception as e:
-        soft_fail("Something went wrong while assembling the results.", f"MAIN EXC {e}")
-        st.error("We ran into a hiccup assembling the results. Please try again or adjust your filters.")
-    finally:
-        friendly_error_summary()
-    """
-    if not have_openai():
-        return None
-    
-    client = get_openai_client()
-    if client is None:
-        return None
-    
-    analysis_prompt = f"""Analyze this West African commodity market article and provide:
-
-**Article Title:** {title}
-**Summary:** {summary}
-**Full Content:** {full_text[:4000]}
-
-Please provide a comprehensive analysis covering:
-
-1. **What This Means**: Explain the core message and significance in 2-3 sentences
-2. **Market Impact**: Assess impact on cashew, shea, cocoa, palm kernel markets (price, supply, demand)
-3. **Business Opportunities**: Identify 3-5 specific opportunities for traders, processors, or investors
-4. **Risk Factors**: Highlight potential risks or challenges mentioned or implied
-5. **Actionable Recommendations**: Provide 3-4 concrete next steps
-
-Be specific, cite numbers/facts from the article, and focus on practical business intelligence."""
-
-    messages = [
-        {"role": "system", "content": "You are an expert market analyst for West African agricultural commodities, specializing in cashew, shea, cocoa, and palm kernel markets. Provide actionable intelligence."},
-        {"role": "user", "content": analysis_prompt}
-    ]
-    
-    model_candidates = ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini", "gpt-3.5-turbo-0125"]
-    
-    for model in model_candidates:
-        try:
-            comp = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=0.3,
-                max_tokens=1500
-            )
-            analysis = (comp.choices[0].message.content or "").strip()
-            if analysis:
-                return analysis
-        except Exception as e:
-            logger.warning(f"Article analysis failed on {model}: {e}")
-            continue
-    
-    return None
+        #
