@@ -633,15 +633,19 @@ def fetch_from_newsdata(
     return items
 
 # ========================= Social Sentiment (Twitter/X) =========================
-def _build_twitter_query(base_query: str, lang: str, since_dt: dt.datetime, until_dt: dt.datetime) -> str:
-    parts = [base_query]
+def build_tw_query(base_query: str, lang: str, since_dt: dt.datetime, until_dt: dt.datetime, mode: str) -> str:
+    """
+    mode: 'api' for v2 Recent Search (do NOT include since/until in the query),
+          'snscrape' to embed since/until operators.
+    """
+    parts = [base_query.strip()]
     if lang:
-        parts.append(f"lang:{lang}")
-    if since_dt:
-        parts.append(f"since:{since_dt.strftime('%Y-%m-%d')}")
-    if until_dt:
-        # X search uses "until:" as exclusive next day; we pass next-day date to include until_dt
-        parts.append(f"until:{(until_dt + dt.timedelta(days=1)).strftime('%Y-%m-%d')}")
+        parts.append(f"lang:{lang.strip()}")
+    if mode == "snscrape":
+        if since_dt:
+            parts.append(f"since:{since_dt.strftime('%Y-%m-%d')}")
+        if until_dt:
+            parts.append(f"until:{(until_dt + dt.timedelta(days=1)).strftime('%Y-%m-%d')}")
     return " ".join(parts).strip()
 
 def _snscrape_available() -> bool:
@@ -651,36 +655,73 @@ def _snscrape_available() -> bool:
     except Exception:
         return False
 
-def fetch_tweets_via_api(bearer: str, query: str, max_results: int = 100) -> List[Dict[str, Any]]:
-    """Twitter/X v2 recent search."""
+def fetch_tweets_via_api(bearer: str, base_query: str, lang: str,
+                         since_dt: dt.datetime, until_dt: dt.datetime,
+                         max_results: int = 300) -> List[Dict[str, Any]]:
+    """Twitter/X v2 recent search with time window & pagination."""
     items: List[Dict[str, Any]] = []
     if not bearer:
         return items
+
     url = "https://api.twitter.com/2/tweets/search/recent"
     headers = {"Authorization": f"Bearer {bearer}"}
+
+    # v2: pass time window as ISO8601 params; DO NOT put since/until in the query
+    query = build_tw_query(base_query, lang, since_dt, until_dt, mode="api")
+
+    page_size = min(100, max(10, max_results))
     params = {
         "query": query,
-        "max_results": min(100, max(10, max_results)),
-        "tweet.fields": "created_at,lang,public_metrics",
+        "max_results": page_size,
+        "tweet.fields": "created_at,lang,public_metrics,referenced_tweets,conversation_id",
+        "expansions": "author_id",
+        "user.fields": "username,name,verified"
     }
-    try:
-        r = requests.get(url, headers=headers, params=params, timeout=20)
-        if r.status_code != 200:
-            soft_fail("Twitter API call failed.", f"twitter api {r.status_code} {r.text[:200]}")
-            return items
-        data = r.json()
-        for t in data.get("data", []):
-            items.append({
-                "id": t.get("id"),
-                "created_at": t.get("created_at"),
-                "text": t.get("text", ""),
-                "lang": t.get("lang"),
-                "retweets": t.get("public_metrics", {}).get("retweet_count", 0),
-                "likes": t.get("public_metrics", {}).get("like_count", 0),
-            })
-    except Exception as e:
-        soft_fail("Twitter API not reachable.", f"twitter api EXC {e}")
-    return items[:max_results]
+    if since_dt:
+        params["start_time"] = since_dt.replace(microsecond=0).isoformat() + "Z"
+    if until_dt:
+        params["end_time"] = until_dt.replace(microsecond=0).isoformat() + "Z"
+
+    got = 0
+    next_token = None
+    session = get_session()
+
+    while got < max_results:
+        q = dict(params)
+        if next_token:
+            q["next_token"] = next_token
+        try:
+            r = session.get(url, headers=headers, params=q, timeout=20)
+            if r.status_code != 200:
+                soft_fail("Twitter API call failed.", f"twitter api {r.status_code} {r.text[:300]}")
+                break
+            data = r.json()
+            users_by_id = {u["id"]: u for u in (data.get("includes", {}).get("users") or [])}
+
+            for t in data.get("data", []):
+                u = users_by_id.get(t.get("author_id"), {})
+                items.append({
+                    "id": t.get("id"),
+                    "created_at": t.get("created_at"),
+                    "text": t.get("text", ""),
+                    "lang": t.get("lang"),
+                    "retweets": t.get("public_metrics", {}).get("retweet_count", 0),
+                    "likes": t.get("public_metrics", {}).get("like_count", 0),
+                    "username": u.get("username", ""),
+                    "url": f"https://x.com/{u.get('username','')}/status/{t.get('id')}" if u.get("username") and t.get("id") else ""
+                })
+                got += 1
+                if got >= max_results:
+                    break
+
+            next_token = (data.get("meta") or {}).get("next_token")
+            if not next_token:
+                break
+        except Exception as e:
+            soft_fail("Twitter API not reachable.", f"twitter api EXC {e}")
+            break
+
+    return items
 
 def fetch_tweets_via_snscrape(query: str, max_results: int = 200) -> List[Dict[str, Any]]:
     """Use snscrape CLI (pip install snscrape)."""
@@ -809,11 +850,10 @@ with act_b2:
     if st.button("♻️ Reset", use_container_width=True, key="reset_main"):
         # Only clear our app's keys; keep secrets & Streamlit internals intact
         for k in list(st.session_state.keys()):
-            if k.startswith(("results_", "ai_", "chat_", "cfg_", "last_scan_", "filters_", "sent_")):
+            if k.startswith(("results_", "ai_", "chat_", "cfg_", "last_scan_", "filters_", "sent_", "tw_")):
                 del st.session_state[k]
         st.rerun()
 with act_b3:
-    # lightweight re-render without recompute (useful if layout glitched)
     if st.button("🔄 Refresh View", use_container_width=True, key="refresh_view"):
         st.rerun()
 
@@ -1165,6 +1205,7 @@ ss_get("filters_impact", [])             # current impact filter
 ss_get("filters_source", [])             # current source filter
 ss_get("sent_df", None)                  # tweets df
 ss_get("sent_summary", {})               # sentiment summary
+ss_get("tw_context", {})                 # last twitter query/window/method context
 
 # Quick Analyze trigger (uses LLM only)
 if run_quick:
@@ -1427,6 +1468,19 @@ def ui_results(df: pd.DataFrame, top_k: int, sent_df: Optional[pd.DataFrame], se
     # -------- Social Sentiment Section --------
     st.markdown("---")
     st.subheader("🐦 Social Sentiment — Twitter/X")
+
+    # Show query/window/method used last scan
+    tw_ctx = st.session_state.get("tw_context", {})
+    if tw_ctx:
+        try:
+            st.caption(
+                f"Query: `{tw_ctx.get('query','')}` • "
+                f"Window: {tw_ctx.get('since','?')} → {tw_ctx.get('until','?')} • "
+                f"Method: {tw_ctx.get('method','n/a')}"
+            )
+        except Exception:
+            pass
+
     if (sent_df is None) or (sent_df is not None and sent_df.empty):
         st.caption("No tweets captured for the current window/query. Enable in the sidebar and click **Scan Now**.")
     else:
@@ -1491,11 +1545,11 @@ if run_btn:
                 st.session_state["last_scan_params"] = current_params
 
             # ---------- Social Sentiment pass (optional) ----------
+            st.session_state["tw_context"] = {}
             if current_params["enable_social"]:
                 with st.spinner("Collecting and analyzing Twitter/X sentiment..."):
                     since_dt = dt.datetime.utcnow() - dt.timedelta(hours=current_params["tw_hours"])
                     until_dt = dt.datetime.utcnow()
-                    q = _build_twitter_query(current_params["tw_query"], current_params["tw_lang"], since_dt, until_dt)
 
                     tweets: List[Dict[str, Any]] = []
                     use_api = False
@@ -1514,15 +1568,25 @@ if run_btn:
                     if use_api and get_twitter_bearer():
                         tweets = fetch_tweets_via_api(
                             bearer=get_twitter_bearer(),
-                            query=q,
+                            base_query=current_params["tw_query"],
+                            lang=current_params["tw_lang"],
+                            since_dt=since_dt,
+                            until_dt=until_dt,
                             max_results=current_params["tw_max"]
                         )
+                        method_used = "API"
+                        query_used = build_tw_query(current_params["tw_query"], current_params["tw_lang"], since_dt, until_dt, mode="api")
                     elif use_sns:
+                        q_sns = build_tw_query(current_params["tw_query"], current_params["tw_lang"], since_dt, until_dt, mode="snscrape")
                         tweets = fetch_tweets_via_snscrape(
-                            query=q,
+                            query=q_sns,
                             max_results=current_params["tw_max"]
                         )
+                        method_used = "snscrape"
+                        query_used = q_sns
                     else:
+                        method_used = "n/a"
+                        query_used = current_params["tw_query"]
                         soft_fail("No Twitter method available.",
                                   "Provide TWITTER_BEARER_TOKEN for API or install snscrape.")
 
@@ -1530,9 +1594,16 @@ if run_btn:
                     summ = summarize_sentiment(df_t)
                     st.session_state["sent_df"] = df_t
                     st.session_state["sent_summary"] = summ
+                    st.session_state["tw_context"] = {
+                        "query": query_used,
+                        "since": since_dt.strftime("%Y-%m-%d %H:%MZ"),
+                        "until": until_dt.strftime("%Y-%m-%d %H:%MZ"),
+                        "method": method_used,
+                    }
             else:
                 st.session_state["sent_df"] = pd.DataFrame()
                 st.session_state["sent_summary"] = {"n": 0, "mean_compound": 0.0, "share_pos": 0.0, "share_neu": 0.0, "share_neg": 0.0}
+                st.session_state["tw_context"] = {}
 
     except Exception as e:
         soft_fail("Something went wrong while assembling the results.", f"MAIN EXC {e}")
