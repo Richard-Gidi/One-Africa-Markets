@@ -12,7 +12,7 @@ from typing import List, Dict, Tuple, Optional, Any
 from urllib.parse import urlparse, urljoin
 import subprocess
 import math
-import time  # for rate-limit sleep + ETA
+import time  # NEW: for rate-limit sleep
 
 import numpy as np
 import pandas as pd
@@ -239,6 +239,7 @@ def get_openai_api_key() -> str:
     return _get_secret_safely("OPENAI_API_KEY")
 
 def get_twitter_bearer() -> str:
+    # X/Twitter v2 bearer token if available
     return _get_secret_safely("TWITTER_BEARER_TOKEN") or _get_secret_safely("X_BEARER_TOKEN")
 
 # ========================= HTTP utils + safe wrappers =========================
@@ -378,7 +379,8 @@ def simple_extractive_summary(text: str, n_sentences: int = 3, keywords: Optiona
         try:
             vec = TfidfVectorizer(stop_words="english", max_features=8000)
             X = vec.fit_transform(sents)  # sparse
-            centroid = np.asarray(X.mean(axis=0)).ravel()  # avoid np.matrix
+            # centroid as 1D numpy array (avoid np.matrix warnings)
+            centroid = np.asarray(X.mean(axis=0)).ravel()
             sims = cosine_similarity(X, centroid.reshape(1, -1)).ravel()
             if keywords:
                 kw = [k.lower() for k in keywords]
@@ -649,6 +651,11 @@ def _to_iso8601_z(ts: dt.datetime) -> str:
     return ts.isoformat().replace("+00:00", "Z")
 
 def _clamp_to_recent_window(start_dt: dt.datetime, end_dt: dt.datetime) -> Tuple[dt.datetime, dt.datetime]:
+    """
+    Twitter v2 recent search only covers ~7 days.
+    If the chosen window exceeds that, clamp start to (end - 6 days 23h).
+    Ensure tz-aware UTC.
+    """
     def _to_utc(x):
         return (x.replace(tzinfo=dt.timezone.utc) if x.tzinfo is None else x.astimezone(dt.timezone.utc))
     end_dt = _to_utc(end_dt)
@@ -693,16 +700,6 @@ def _sleep_until_reset(reset_unix: int, cap_seconds: int = 30) -> int:
     if wait > 0:
         time.sleep(wait)
     return wait
-
-def _remember_rate_info(limit: int, remaining: int, reset_unix: int):
-    try:
-        st.session_state["tw_rate_info"] = {
-            "limit": int(limit),
-            "remaining": int(remaining),
-            "reset_unix": int(reset_unix),
-        }
-    except Exception:
-        pass
 
 def _snscrape_available() -> bool:
     try:
@@ -757,7 +754,7 @@ def fetch_tweets_via_api(
 ) -> List[Dict[str, Any]]:
     """
     Twitter/X v2 recent search with pagination, user expansion,
-    429-aware (sleep+retry once), cache upstream, and session-stored rate info.
+    one retry on 429 (using x-rate-limit-reset), and verbose diagnostics.
     """
     items: List[Dict[str, Any]] = []
     if not bearer:
@@ -768,7 +765,7 @@ def fetch_tweets_via_api(
 
     url = "https://api.twitter.com/2/tweets/search/recent"
     headers = {"Authorization": f"Bearer {bearer}", "User-Agent": "OneAfricaPulse/1.0"}
-    page_size = min(50, max(10, max_results))  # gentler default than 100
+    page_size = min(100, max(10, max_results))
     next_token = None
     fetched = 0
     user_map: Dict[str, Dict[str, Any]] = {}
@@ -792,20 +789,8 @@ def fetch_tweets_via_api(
     while fetched < max_results:
         r = _one_page(next_token)
 
-        # store rate info from headers ASAP
-        limit, remaining, reset_unix = _parse_rate_limit_headers(r)
-        _remember_rate_info(limit, remaining, reset_unix)
-
-        # If fully out of quota and it's a 429, don't hammer—return and let caller fallback
-        if remaining == 0 and r.status_code == 429:
-            soft_fail("Twitter API out of calls; using snscrape fallback.",
-                      f"limit={limit} remaining={remaining} reset_unix={reset_unix}")
-            return []
-
         if r.status_code == 429:
-            # sleep once and retry
             limit, remaining, reset_unix = _parse_rate_limit_headers(r)
-            _remember_rate_info(limit, remaining, reset_unix)
             soft_fail("Twitter API rate-limited (429).",
                       f"limit={limit} remaining={remaining} reset_unix={reset_unix}")
             if not tried_retry_on_429:
@@ -813,24 +798,17 @@ def fetch_tweets_via_api(
                 slept = _sleep_until_reset(reset_unix, cap_seconds=30)
                 if slept > 0:
                     r = _one_page(next_token)
-                    # store headers again after retry
-                    limit, remaining, reset_unix = _parse_rate_limit_headers(r)
-                    _remember_rate_info(limit, remaining, reset_unix)
                     if r.status_code == 429:
-                        return []
+                        break
                 else:
-                    return []
+                    break
             else:
-                return []
+                break
 
         if r.status_code != 200:
             txt = r.text[:300].replace("\n", " ")
             soft_fail("Twitter API call failed.", f"twitter api {r.status_code} {txt}")
-            return []
-
-        # also store headers after a successful page (remaining usually decrements)
-        limit, remaining, reset_unix = _parse_rate_limit_headers(r)
-        _remember_rate_info(limit, remaining, reset_unix)
+            break
 
         data = r.json()
         for u in (data.get("includes", {}) or {}).get("users", []) or []:
@@ -840,7 +818,7 @@ def fetch_tweets_via_api(
         if not batch and not data.get("meta", {}).get("next_token"):
             soft_fail("Twitter returned zero results.",
                       f"Query='{query}' window={start_time.isoformat()}→{end_time.isoformat()}")
-            return items
+            break
 
         for t in batch:
             au = user_map.get(t.get("author_id") or "", {})
@@ -960,7 +938,7 @@ with act_b1:
 with act_b2:
     if st.button("♻️ Reset", use_container_width=True, key="reset_main"):
         for k in list(st.session_state.keys()):
-            if k.startswith(("results_", "ai_", "chat_", "cfg_", "last_scan_", "filters_", "sent_", "tw_rate_info")):
+            if k.startswith(("results_", "ai_", "chat_", "cfg_", "last_scan_", "filters_", "sent_")):
                 del st.session_state[k]
         st.rerun()
 with act_b3:
@@ -995,6 +973,7 @@ if "chat_history" not in st.session_state:
 def have_openai():
     return OPENAI_OK and bool(get_openai_api_key())
 
+# ---- Robust client (respects OPENAI_BASE_URL if set) ----
 def get_openai_client():
     try:
         api_key = get_openai_api_key()
@@ -1003,7 +982,7 @@ def get_openai_client():
         base_url = os.environ.get("OPENAI_BASE_URL", "").strip()
         if base_url:
             return OpenAI(api_key=api_key, base_url=base_url)
-        return OpenAI(api_key=api_key)
+        return OpenAI(api_key=api_key)  # official endpoint
     except Exception as e:
         logger.warning(f"OpenAI client init failed: {e}")
         return None
@@ -1130,7 +1109,6 @@ with st.sidebar:
                     r = requests.get(url, headers={"Authorization": f"Bearer {bearer}"}, params=params, timeout=15)
                     st.write(f"HTTP {r.status_code}")
                     limit, remaining, reset_unix = _parse_rate_limit_headers(r)
-                    _remember_rate_info(limit, remaining, reset_unix)  # remember limits in session
                     st.write(f"Rate limit: limit={limit}, remaining={remaining}, reset_unix={reset_unix}")
                     if reset_unix and reset_unix > 0:
                         eta = max(0, reset_unix - int(time.time()))
@@ -1269,7 +1247,8 @@ with st.sidebar:
         custom_kw = st.text_area("Keywords (comma-separated)", ", ".join(DEFAULT_KEYWORDS), height=100, key="kw_text")
         keywords = [k.strip() for k in custom_kw.split(",") if k.strip()]
         min_relevance = st.number_input("Min relevance (0.00–1.00)", min_value=0.0, max_value=1.0, value=0.05, step=0.01, format="%.2f", key="min_rel")
-        per_source_cap = st.number_input("Max articles per source", min_value=1, max_value=200, value=10, step=1, key="cap")  # default 10
+        # Default set to 10 as requested
+        per_source_cap = st.number_input("Max articles per source", min_value=1, max_value=200, value=10, step=1, key="cap")
 
         st.markdown("---")
 
@@ -1342,7 +1321,6 @@ ss_get("filters_impact", [])
 ss_get("filters_source", [])
 ss_get("sent_df", None)
 ss_get("sent_summary", {})
-ss_get("tw_rate_info", {})  # store last seen rate-limit info
 
 # Quick Analyze trigger (uses LLM only)
 if run_quick:
@@ -1665,6 +1643,7 @@ if run_btn:
                 with st.spinner("Collecting and analyzing Twitter/X sentiment..."):
                     since_dt = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=current_params["tw_hours"])
                     until_dt = dt.datetime.now(dt.timezone.utc)
+                    # Clamp to ≤7 days for API
                     api_start, api_end = _clamp_to_recent_window(since_dt, until_dt)
 
                     q_api = _build_query_for_api(current_params["tw_query"], current_params["tw_lang"])
@@ -1680,25 +1659,6 @@ if run_btn:
                     prefer_sns = (current_params["tw_method"] == "snscrape") or (
                         current_params["tw_method"] == "Auto" and not get_twitter_bearer() and _snscrape_available()
                     )
-
-                    # If prior call says we're out of quota, flip to snscrape automatically
-                    rate_info = st.session_state.get("tw_rate_info", {})
-                    if isinstance(rate_info, dict):
-                        rem = rate_info.get("remaining", 1)
-                        rz  = rate_info.get("reset_unix", -1)
-                        if rem == 0:
-                            prefer_api = False
-                            prefer_sns = True
-                            try:
-                                eta = max(0, int(rz) - int(time.time())) if isinstance(rz, int) else None
-                                if eta is not None:
-                                    mins = eta // 60
-                                    secs = eta % 60
-                                    st.info(f"🐦 Twitter API quota exhausted. Auto-using snscrape until reset in ~{mins}m {secs}s.")
-                                else:
-                                    st.info("🐦 Twitter API quota exhausted. Auto-using snscrape until rate limit resets.")
-                            except Exception:
-                                st.info("🐦 Twitter API quota exhausted. Auto-using snscrape until rate limit resets.")
 
                     if prefer_api and get_twitter_bearer():
                         tried_api = True
