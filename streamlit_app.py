@@ -12,6 +12,7 @@ from typing import List, Dict, Tuple, Optional, Any
 from urllib.parse import urlparse, urljoin
 import subprocess
 import math
+import time  # NEW: for rate-limit sleep
 
 import numpy as np
 import pandas as pd
@@ -377,9 +378,10 @@ def simple_extractive_summary(text: str, n_sentences: int = 3, keywords: Optiona
     if HAS_SK:
         try:
             vec = TfidfVectorizer(stop_words="english", max_features=8000)
-            X = vec.fit_transform(sents)
-            centroid = X.mean(axis=0)
-            sims = cosine_similarity(X, centroid).ravel()
+            X = vec.fit_transform(sents)  # sparse
+            # centroid as 1D numpy array (avoid np.matrix warnings)
+            centroid = np.asarray(X.mean(axis=0)).ravel()
+            sims = cosine_similarity(X, centroid.reshape(1, -1)).ravel()
             if keywords:
                 kw = [k.lower() for k in keywords]
                 boost = np.array([sum(1 for w in re.findall(r"[a-z']+", s.lower()) if w in kw) for s in sents], dtype=float)
@@ -454,6 +456,14 @@ def parse_feed_xml(content: bytes, base_url: str) -> List[Dict[str, str]]:
     items: List[Dict[str, str]] = []
     if not content:
         return items
+    # Quick sanity: ensure XML-ish
+    try:
+        sample = content.lstrip()[:16]
+        if not sample.startswith(b"<") and not sample.startswith(b"\xef\xbb\xbf<"):
+            soft_fail("Skipped one feed that returned non-XML.", f"parse_feed_xml non-xml from {base_url}")
+            return items
+    except Exception:
+        pass
     try:
         root = ET.fromstring(content)
         channel = root.find("channel")
@@ -633,38 +643,7 @@ def fetch_from_newsdata(
     return items
 
 # ========================= Social Sentiment (Twitter/X) =========================
-def _snscrape_available() -> bool:
-    try:
-        res = subprocess.run(["snscrape", "--help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        return (res.returncode == 0)
-    except Exception:
-        return False
-
-def _build_query_for_api(base_query: str, lang: str) -> str:
-    """
-    Build a v2-compatible query string. DO NOT include since:/until: here.
-    """
-    parts = [base_query.strip()]
-    if lang:
-        parts.append(f"lang:{lang.strip()}")
-    parts += ["-is:retweet", "-is:reply", "-is:quote"]
-    return " ".join([p for p in parts if p])
-
-def _build_query_for_snscrape(base_query: str, lang: str,
-                              since_dt: dt.datetime, until_dt: dt.datetime) -> str:
-    """
-    snscrape supports since:/until: in the query text.
-    """
-    parts = [base_query.strip()]
-    if lang:
-        parts.append(f"lang:{lang.strip()}")
-    parts.append(f"since:{since_dt.strftime('%Y-%m-%d')}")
-    parts.append(f"until:{(until_dt + dt.timedelta(days=1)).strftime('%Y-%m-%d')}")
-    parts += ["-is:retweet", "-is:reply", "-is:quote"]
-    return " ".join([p for p in parts if p])
-
 def _to_iso8601_z(ts: dt.datetime) -> str:
-    # Ensure timezone-aware UTC for Twitter API
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=dt.timezone.utc)
     else:
@@ -681,10 +660,90 @@ def _clamp_to_recent_window(start_dt: dt.datetime, end_dt: dt.datetime) -> Tuple
         return (x.replace(tzinfo=dt.timezone.utc) if x.tzinfo is None else x.astimezone(dt.timezone.utc))
     end_dt = _to_utc(end_dt)
     start_dt = _to_utc(start_dt)
-    max_span = dt.timedelta(days=6, hours=23)  # a hair under 7 days
+    max_span = dt.timedelta(days=6, hours=23)
     if end_dt - start_dt > max_span:
         start_dt = end_dt - max_span
     return start_dt, end_dt
+
+def _build_query_for_api(base_query: str, lang: str) -> str:
+    parts = [base_query.strip()]
+    if lang:
+        parts.append(f"lang:{lang.strip()}")
+    parts += ["-is:retweet", "-is:reply", "-is:quote"]
+    return " ".join([p for p in parts if p])
+
+def _build_query_for_snscrape(base_query: str, lang: str,
+                              since_dt: dt.datetime, until_dt: dt.datetime) -> str:
+    parts = [base_query.strip()]
+    if lang:
+        parts.append(f"lang:{lang.strip()}")
+    parts.append(f"since:{since_dt.strftime('%Y-%m-%d')}")
+    parts.append(f"until:{(until_dt + dt.timedelta(days=1)).strftime('%Y-%m-%d')}")
+    parts += ["-is:retweet", "-is:reply", "-is:quote"]
+    return " ".join([p for p in parts if p])
+
+def _parse_rate_limit_headers(resp) -> Tuple[int,int,int]:
+    try: limit = int(resp.headers.get("x-rate-limit-limit", "-1"))
+    except Exception: limit = -1
+    try: remaining = int(resp.headers.get("x-rate-limit-remaining", "-1"))
+    except Exception: remaining = -1
+    try: reset = int(resp.headers.get("x-rate-limit-reset", "-1"))
+    except Exception: reset = -1
+    return limit, remaining, reset
+
+def _sleep_until_reset(reset_unix: int, cap_seconds: int = 30) -> int:
+    if reset_unix is None or reset_unix < 0:
+        return 0
+    now = int(time.time())
+    wait = max(0, reset_unix - now)
+    wait = min(wait, cap_seconds)
+    if wait > 0:
+        time.sleep(wait)
+    return wait
+
+def _snscrape_available() -> bool:
+    try:
+        import snscrape  # noqa: F401
+        from snscrape.modules import twitter as sntwitter  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+def fetch_tweets_via_snscrape(query: str, max_results: int = 200) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    try:
+        from snscrape.modules import twitter as sntwitter
+    except Exception:
+        soft_fail("snscrape is not installed.", "Install with: pip install snscrape")
+        return items
+
+    try:
+        scraper = sntwitter.TwitterSearchScraper(query)
+        for i, tw in enumerate(scraper.get_items()):
+            if i >= max_results:
+                break
+            try:
+                items.append({
+                    "id": getattr(tw, "id", None),
+                    "created_at": getattr(tw, "date", None),
+                    "text": getattr(tw, "content", "") or "",
+                    "lang": getattr(tw, "lang", None),
+                    "retweets": getattr(tw, "retweetCount", 0) or 0,
+                    "likes": getattr(tw, "likeCount", 0) or 0,
+                    "username": getattr(getattr(tw, "user", None), "username", "") or "",
+                    "url": getattr(tw, "url", "") or "",
+                })
+            except Exception:
+                continue
+    except Exception as e:
+        soft_fail("snscrape search failed.", f"snscrape EXC {e}")
+    return items
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _twitter_api_cached(bearer: str, query: str, start_iso: str, end_iso: str, max_results: int):
+    start_dt = dt.datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+    end_dt = dt.datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+    return fetch_tweets_via_api(bearer, query, start_dt, end_dt, max_results)
 
 def fetch_tweets_via_api(
     bearer: str,
@@ -694,9 +753,8 @@ def fetch_tweets_via_api(
     max_results: int = 100
 ) -> List[Dict[str, Any]]:
     """
-    Twitter/X v2 recent search with pagination and user expansion.
-    Uses start_time/end_time params instead of since:/until: operators.
-    Verbose soft_fail messages if errors or zero results.
+    Twitter/X v2 recent search with pagination, user expansion,
+    one retry on 429 (using x-rate-limit-reset), and verbose diagnostics.
     """
     items: List[Dict[str, Any]] = []
     if not bearer:
@@ -706,17 +764,13 @@ def fetch_tweets_via_api(
     start_time, end_time = _clamp_to_recent_window(start_time, end_time)
 
     url = "https://api.twitter.com/2/tweets/search/recent"
-    headers = {
-        "Authorization": f"Bearer {bearer}",
-        "User-Agent": "OneAfricaPulse/1.0"
-    }
-
+    headers = {"Authorization": f"Bearer {bearer}", "User-Agent": "OneAfricaPulse/1.0"}
     page_size = min(100, max(10, max_results))
     next_token = None
     fetched = 0
     user_map: Dict[str, Dict[str, Any]] = {}
 
-    while fetched < max_results:
+    def _one_page(next_tok: Optional[str]):
         params = {
             "query": query,
             "max_results": page_size,
@@ -726,80 +780,67 @@ def fetch_tweets_via_api(
             "expansions": "author_id",
             "user.fields": "username,name,public_metrics,verified"
         }
-        if next_token:
-            params["next_token"] = next_token
+        if next_tok:
+            params["next_token"] = next_tok
+        return requests.get(url, headers=headers, params=params, timeout=20)
 
-        try:
-            r = requests.get(url, headers=headers, params=params, timeout=20)
-            if r.status_code != 200:
-                txt = r.text[:300].replace("\n", " ")
-                soft_fail("Twitter API call failed.", f"twitter api {r.status_code} {txt}")
-                break
+    tried_retry_on_429 = False
 
-            data = r.json()
-            for u in (data.get("includes", {}) or {}).get("users", []) or []:
-                user_map[u.get("id")] = u
+    while fetched < max_results:
+        r = _one_page(next_token)
 
-            batch = data.get("data", []) or []
-            if not batch and not data.get("meta", {}).get("next_token"):
-                soft_fail("Twitter returned zero results.",
-                          f"Query='{query}' window={start_time.isoformat()}→{end_time.isoformat()}")
-                break
-
-            for t in batch:
-                au = user_map.get(t.get("author_id") or "", {})
-                items.append({
-                    "id": t.get("id"),
-                    "created_at": t.get("created_at"),
-                    "text": t.get("text", ""),
-                    "lang": t.get("lang"),
-                    "retweets": t.get("public_metrics", {}).get("retweet_count", 0),
-                    "likes": t.get("public_metrics", {}).get("like_count", 0),
-                    "username": au.get("username", ""),
-                    "url": f"https://twitter.com/{au.get('username','i')}/status/{t.get('id')}"
-                })
-                fetched += 1
-                if fetched >= max_results:
+        if r.status_code == 429:
+            limit, remaining, reset_unix = _parse_rate_limit_headers(r)
+            soft_fail("Twitter API rate-limited (429).",
+                      f"limit={limit} remaining={remaining} reset_unix={reset_unix}")
+            if not tried_retry_on_429:
+                tried_retry_on_429 = True
+                slept = _sleep_until_reset(reset_unix, cap_seconds=30)
+                if slept > 0:
+                    r = _one_page(next_token)
+                    if r.status_code == 429:
+                        break
+                else:
                     break
-
-            next_token = data.get("meta", {}).get("next_token")
-            if not next_token:
+            else:
                 break
 
-        except Exception as e:
-            soft_fail("Twitter API not reachable.", f"twitter api EXC {e}")
+        if r.status_code != 200:
+            txt = r.text[:300].replace("\n", " ")
+            soft_fail("Twitter API call failed.", f"twitter api {r.status_code} {txt}")
+            break
+
+        data = r.json()
+        for u in (data.get("includes", {}) or {}).get("users", []) or []:
+            user_map[u.get("id")] = u
+
+        batch = data.get("data", []) or []
+        if not batch and not data.get("meta", {}).get("next_token"):
+            soft_fail("Twitter returned zero results.",
+                      f"Query='{query}' window={start_time.isoformat()}→{end_time.isoformat()}")
+            break
+
+        for t in batch:
+            au = user_map.get(t.get("author_id") or "", {})
+            items.append({
+                "id": t.get("id"),
+                "created_at": t.get("created_at"),
+                "text": t.get("text", ""),
+                "lang": t.get("lang"),
+                "retweets": t.get("public_metrics", {}).get("retweet_count", 0),
+                "likes": t.get("public_metrics", {}).get("like_count", 0),
+                "username": au.get("username", ""),
+                "url": f"https://twitter.com/{au.get('username','i')}/status/{t.get('id')}"
+            })
+            fetched += 1
+            if fetched >= max_results:
+                break
+
+        next_token = data.get("meta", {}).get("next_token")
+        if not next_token:
             break
 
     return items[:max_results]
-
-def fetch_tweets_via_snscrape(query: str, max_results: int = 200) -> List[Dict[str, Any]]:
-    """Use snscrape CLI (pip install snscrape)."""
-    items: List[Dict[str, Any]] = []
-    if not _snscrape_available():
-        soft_fail("snscrape is not installed.", "Install with: pip install snscrape")
-        return items
-    cmd = ["snscrape", "--max-results", str(max_results), "--jsonl", "twitter-search", query]
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        for line in proc.stdout:
-            try:
-                j = json.loads(line.strip())
-                items.append({
-                    "id": j.get("id"),
-                    "created_at": j.get("date"),
-                    "text": j.get("content", ""),
-                    "lang": j.get("lang"),
-                    "retweets": j.get("retweetCount", 0),
-                    "likes": j.get("likeCount", 0),
-                    "username": j.get("user", {}).get("username"),
-                    "url": j.get("url")
-                })
-            except Exception:
-                continue
-        proc.wait(timeout=10)
-    except Exception as e:
-        soft_fail("snscrape search failed.", f"snscrape EXC {e}")
-    return items
 
 def get_sentiment_analyzer():
     if not HAS_VADER:
@@ -865,7 +906,7 @@ def make_digest(df: pd.DataFrame, top_k: int = 12) -> str:
     header = f"# {APP_NAME} — Daily Digest\n\n*{TAGLINE}*\n\n> {QUOTE}\n\n"
     if df.empty:
         return header + "_No relevant items found for the selected period._"
-    parts = [header, f"**Date:** {dt.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}\n\n"]
+    parts = [header, f"**Date:** {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n\n"]
     for _, row in df.head(top_k).iterrows():
         impact = ", ".join(row["impact"])
         parts.append(
@@ -896,7 +937,6 @@ with act_b1:
     run_btn = st.button("🚀 Scan Now", use_container_width=True, key="run_main")
 with act_b2:
     if st.button("♻️ Reset", use_container_width=True, key="reset_main"):
-        # Only clear our app's keys; keep secrets & Streamlit internals intact
         for k in list(st.session_state.keys()):
             if k.startswith(("results_", "ai_", "chat_", "cfg_", "last_scan_", "filters_", "sent_")):
                 del st.session_state[k]
@@ -1068,14 +1108,18 @@ with st.sidebar:
                     params = {"query": "news -is:retweet", "max_results": 10}
                     r = requests.get(url, headers={"Authorization": f"Bearer {bearer}"}, params=params, timeout=15)
                     st.write(f"HTTP {r.status_code}")
-                    txt = r.text[:500]
-                    st.code(txt)
+                    limit, remaining, reset_unix = _parse_rate_limit_headers(r)
+                    st.write(f"Rate limit: limit={limit}, remaining={remaining}, reset_unix={reset_unix}")
+                    if reset_unix and reset_unix > 0:
+                        eta = max(0, reset_unix - int(time.time()))
+                        st.write(f"Resets in ~{eta} seconds")
+                    st.code(r.text[:500])
                     if r.status_code == 401:
                         st.warning("401 Unauthorized: token invalid/expired or project lacks access.")
                     elif r.status_code == 403:
                         st.warning("403 Forbidden: your project tier may not have recent search access.")
                     elif r.status_code == 429:
-                        st.warning("429 Rate limit: too many requests in your tier window.")
+                        st.warning("429 Rate limit: reduce frequency/max_results, or wait for reset.")
                 except Exception as e:
                     st.error(f"Request failed: {e}")
 
@@ -1203,7 +1247,7 @@ with st.sidebar:
         custom_kw = st.text_area("Keywords (comma-separated)", ", ".join(DEFAULT_KEYWORDS), height=100, key="kw_text")
         keywords = [k.strip() for k in custom_kw.split(",") if k.strip()]
         min_relevance = st.number_input("Min relevance (0.00–1.00)", min_value=0.0, max_value=1.0, value=0.05, step=0.01, format="%.2f", key="min_rel")
-        # ↓ Default set to 10 as requested
+        # Default set to 10 as requested
         per_source_cap = st.number_input("Max articles per source", min_value=1, max_value=200, value=10, step=1, key="cap")
 
         st.markdown("---")
@@ -1269,14 +1313,14 @@ current_params = {
 }
 
 # ---- Durable stores (persist across reruns) ----
-ss_get("results_df", None)               # pandas.DataFrame or None
-ss_get("results_digest_md", "")          # str
-ss_get("ai_analyses", {})                # dict card_key -> markdown
-ss_get("last_scan_params", {})           # dict of the last run inputs (window, keywords, etc.)
-ss_get("filters_impact", [])             # current impact filter
-ss_get("filters_source", [])             # current source filter
-ss_get("sent_df", None)                  # tweets df
-ss_get("sent_summary", {})               # sentiment summary
+ss_get("results_df", None)
+ss_get("results_digest_md", "")
+ss_get("ai_analyses", {})
+ss_get("last_scan_params", {})
+ss_get("filters_impact", [])
+ss_get("filters_source", [])
+ss_get("sent_df", None)
+ss_get("sent_summary", {})
 
 # Quick Analyze trigger (uses LLM only)
 if run_quick:
@@ -1521,7 +1565,7 @@ def ui_results(df: pd.DataFrame, top_k: int, sent_df: Optional[pd.DataFrame], se
         st.markdown(digest_md)
 
         st.subheader("⬇️ Downloads")
-        ts = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
         export_df = filtered if (impact_filter or source_filter) else df
         csv_name = f"oneafrica_pulse_{ts}.csv"
         md_name = f"oneafrica_pulse_digest_{ts}.md"
@@ -1597,8 +1641,8 @@ if run_btn:
             # ---------- Social Sentiment pass (optional) ----------
             if current_params["enable_social"]:
                 with st.spinner("Collecting and analyzing Twitter/X sentiment..."):
-                    since_dt = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc) - dt.timedelta(hours=current_params["tw_hours"])
-                    until_dt = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+                    since_dt = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=current_params["tw_hours"])
+                    until_dt = dt.datetime.now(dt.timezone.utc)
                     # Clamp to ≤7 days for API
                     api_start, api_end = _clamp_to_recent_window(since_dt, until_dt)
 
@@ -1618,11 +1662,13 @@ if run_btn:
 
                     if prefer_api and get_twitter_bearer():
                         tried_api = True
-                        tweets = fetch_tweets_via_api(
+                        start_iso = _to_iso8601_z(api_start)
+                        end_iso = _to_iso8601_z(api_end)
+                        tweets = _twitter_api_cached(
                             bearer=get_twitter_bearer(),
                             query=q_api,
-                            start_time=api_start,
-                            end_time=api_end,
+                            start_iso=start_iso,
+                            end_iso=end_iso,
                             max_results=current_params["tw_max"]
                         )
 
