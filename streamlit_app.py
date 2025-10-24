@@ -633,17 +633,6 @@ def fetch_from_newsdata(
     return items
 
 # ========================= Social Sentiment (Twitter/X) =========================
-def _build_twitter_query(base_query: str, lang: str, since_dt: dt.datetime, until_dt: dt.datetime) -> str:
-    parts = [base_query]
-    if lang:
-        parts.append(f"lang:{lang}")
-    if since_dt:
-        parts.append(f"since:{since_dt.strftime('%Y-%m-%d')}")
-    if until_dt:
-        # X search uses "until:" as exclusive next day; we pass next-day date to include until_dt
-        parts.append(f"until:{(until_dt + dt.timedelta(days=1)).strftime('%Y-%m-%d')}")
-    return " ".join(parts).strip()
-
 def _snscrape_available() -> bool:
     try:
         res = subprocess.run(["snscrape", "--help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -651,35 +640,107 @@ def _snscrape_available() -> bool:
     except Exception:
         return False
 
-def fetch_tweets_via_api(bearer: str, query: str, max_results: int = 100) -> List[Dict[str, Any]]:
-    """Twitter/X v2 recent search."""
+def _build_query_for_api(base_query: str, lang: str) -> str:
+    """
+    Build a v2-compatible query string. DO NOT include since:/until: here.
+    """
+    parts = [base_query.strip()]
+    if lang:
+        parts.append(f"lang:{lang.strip()}")
+    parts += ["-is:retweet", "-is:reply", "-is:quote"]
+    return " ".join([p for p in parts if p])
+
+def _build_query_for_snscrape(base_query: str, lang: str,
+                              since_dt: dt.datetime, until_dt: dt.datetime) -> str:
+    """
+    snscrape supports since:/until: in the query text.
+    """
+    parts = [base_query.strip()]
+    if lang:
+        parts.append(f"lang:{lang.strip()}")
+    parts.append(f"since:{since_dt.strftime('%Y-%m-%d')}")
+    parts.append(f"until:{(until_dt + dt.timedelta(days=1)).strftime('%Y-%m-%d')}")
+    parts += ["-is:retweet", "-is:reply", "-is:quote"]
+    return " ".join([p for p in parts if p])
+
+def _to_iso8601_z(ts: dt.datetime) -> str:
+    # Ensure timezone-aware UTC for Twitter API
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=dt.timezone.utc)
+    else:
+        ts = ts.astimezone(dt.timezone.utc)
+    return ts.isoformat().replace("+00:00", "Z")
+
+def fetch_tweets_via_api(
+    bearer: str,
+    query: str,
+    start_time: dt.datetime,
+    end_time: dt.datetime,
+    max_results: int = 100
+) -> List[Dict[str, Any]]:
+    """
+    Twitter/X v2 recent search with pagination and user expansion.
+    Uses start_time/end_time params instead of since:/until: operators.
+    """
     items: List[Dict[str, Any]] = []
     if not bearer:
         return items
+
     url = "https://api.twitter.com/2/tweets/search/recent"
     headers = {"Authorization": f"Bearer {bearer}"}
-    params = {
-        "query": query,
-        "max_results": min(100, max(10, max_results)),
-        "tweet.fields": "created_at,lang,public_metrics",
-    }
-    try:
-        r = requests.get(url, headers=headers, params=params, timeout=20)
-        if r.status_code != 200:
-            soft_fail("Twitter API call failed.", f"twitter api {r.status_code} {r.text[:200]}")
-            return items
-        data = r.json()
-        for t in data.get("data", []):
-            items.append({
-                "id": t.get("id"),
-                "created_at": t.get("created_at"),
-                "text": t.get("text", ""),
-                "lang": t.get("lang"),
-                "retweets": t.get("public_metrics", {}).get("retweet_count", 0),
-                "likes": t.get("public_metrics", {}).get("like_count", 0),
-            })
-    except Exception as e:
-        soft_fail("Twitter API not reachable.", f"twitter api EXC {e}")
+
+    page_size = min(100, max(10, max_results))
+    next_token = None
+    fetched = 0
+    user_map: Dict[str, Dict[str, Any]] = {}
+
+    while fetched < max_results:
+        params = {
+            "query": query,
+            "max_results": page_size,
+            "start_time": _to_iso8601_z(start_time),
+            "end_time": _to_iso8601_z(end_time),
+            "tweet.fields": "created_at,lang,public_metrics,author_id",
+            "expansions": "author_id",
+            "user.fields": "username,name,public_metrics,verified"
+        }
+        if next_token:
+            params["next_token"] = next_token
+
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=20)
+            if r.status_code != 200:
+                soft_fail("Twitter API call failed.", f"twitter api {r.status_code} {r.text[:200]}")
+                break
+
+            data = r.json()
+            for u in (data.get("includes", {}) or {}).get("users", []) or []:
+                user_map[u.get("id")] = u
+
+            batch = data.get("data", []) or []
+            for t in batch:
+                au = user_map.get(t.get("author_id") or "", {})
+                items.append({
+                    "id": t.get("id"),
+                    "created_at": t.get("created_at"),
+                    "text": t.get("text", ""),
+                    "lang": t.get("lang"),
+                    "retweets": t.get("public_metrics", {}).get("retweet_count", 0),
+                    "likes": t.get("public_metrics", {}).get("like_count", 0),
+                    "username": au.get("username", ""),
+                    "url": f"https://twitter.com/{au.get('username','i')}/status/{t.get('id')}"
+                })
+                fetched += 1
+                if fetched >= max_results:
+                    break
+
+            next_token = data.get("meta", {}).get("next_token")
+            if not next_token:
+                break
+        except Exception as e:
+            soft_fail("Twitter API not reachable.", f"twitter api EXC {e}")
+            break
+
     return items[:max_results]
 
 def fetch_tweets_via_snscrape(query: str, max_results: int = 200) -> List[Dict[str, Any]]:
@@ -750,7 +811,6 @@ def analyze_tweet_sentiment(tweets: List[Dict[str, Any]]) -> pd.DataFrame:
         })
     df = pd.DataFrame(rows)
     if not df.empty:
-        # sort newest first
         try:
             df["created_at"] = pd.to_datetime(df["created_at"])
             df = df.sort_values("created_at", ascending=False).reset_index(drop=True)
@@ -813,7 +873,6 @@ with act_b2:
                 del st.session_state[k]
         st.rerun()
 with act_b3:
-    # lightweight re-render without recompute (useful if layout glitched)
     if st.button("🔄 Refresh View", use_container_width=True, key="refresh_view"):
         st.rerun()
 
@@ -1092,7 +1151,8 @@ with st.sidebar:
         custom_kw = st.text_area("Keywords (comma-separated)", ", ".join(DEFAULT_KEYWORDS), height=100, key="kw_text")
         keywords = [k.strip() for k in custom_kw.split(",") if k.strip()]
         min_relevance = st.number_input("Min relevance (0.00–1.00)", min_value=0.0, max_value=1.0, value=0.05, step=0.01, format="%.2f", key="min_rel")
-        per_source_cap = st.number_input("Max articles per source", min_value=1, max_value=200, value=20, step=1, key="cap")
+        # ↓ Default set to 10 as requested
+        per_source_cap = st.number_input("Max articles per source", min_value=1, max_value=200, value=10, step=1, key="cap")
 
         st.markdown("---")
 
@@ -1311,7 +1371,6 @@ def fetch_all(params: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 # ========================= Card Renderer with functional widgets =========================
 def render_card(row: pd.Series):
-    # Stable per-card key & results cache
     key = f"card_{hash_key(row['title'], row['link'])}"
     if "ai_analyses" not in st.session_state:
         st.session_state.ai_analyses = {}
@@ -1326,7 +1385,6 @@ def render_card(row: pd.Series):
     tags = row["impact"] or ["General"]
 
     with st.container():
-        # Visual card
         st.markdown(f"""
         <div class="card">
           <img class="thumb" src="{img}" alt="thumbnail">
@@ -1344,14 +1402,12 @@ def render_card(row: pd.Series):
         </div>
         """, unsafe_allow_html=True)
 
-        # Widgets MUST be streamlit-native (not inside raw HTML wrappers)
         with st.expander("🔎 Analyze with AI", expanded=False):
             if not have_openai():
                 st.warning("Add an `OPENAI_API_KEY` to your `.env` or Streamlit Secrets to run AI analysis.")
                 st.info("Tip: open the 🧪 Diagnostics panel in the sidebar.")
                 st.stop()
 
-            # Show previous analysis if already computed
             prev = st.session_state.ai_analyses.get(key)
             if prev:
                 st.markdown(prev)
@@ -1398,7 +1454,6 @@ def ui_results(df: pd.DataFrame, top_k: int, sent_df: Optional[pd.DataFrame], se
         if source_filter:
             filtered = filtered[filtered["source"].isin(source_filter)]
 
-        # Streamlit-native tiling
         cards = list(filtered.to_dict("records"))
         n = 3  # 3 columns
         for i in range(0, len(cards), n):
@@ -1440,7 +1495,6 @@ def ui_results(df: pd.DataFrame, top_k: int, sent_df: Optional[pd.DataFrame], se
         with met4:
             st.metric("Negative", f"{100*sent_summary.get('share_neg',0.0):.1f}%")
 
-        # Simple bar share
         share_df = pd.DataFrame({
             "label": ["Positive","Neutral","Negative"],
             "share": [
@@ -1476,7 +1530,6 @@ if 'run_btn' not in locals():
     run_btn = False  # safety
 
 if run_btn:
-    # You explicitly asked to scan now → do the work and persist it
     try:
         if not current_params["chosen_sources"] and not (current_params["use_newsdata"] and current_params["newsdata_key"]):
             st.error("Pick at least one RSS source or enable Newsdata.io (see Configurations).")
@@ -1485,7 +1538,6 @@ if run_btn:
                 rows = fetch_all(current_params)
                 df = process_rows(rows)
 
-                # Persist news results so they survive reruns
                 st.session_state["results_df"] = df
                 st.session_state["results_digest_md"] = make_digest(df, top_k=current_params["top_k"])
                 st.session_state["last_scan_params"] = current_params
@@ -1493,9 +1545,12 @@ if run_btn:
             # ---------- Social Sentiment pass (optional) ----------
             if current_params["enable_social"]:
                 with st.spinner("Collecting and analyzing Twitter/X sentiment..."):
-                    since_dt = dt.datetime.utcnow() - dt.timedelta(hours=current_params["tw_hours"])
-                    until_dt = dt.datetime.utcnow()
-                    q = _build_twitter_query(current_params["tw_query"], current_params["tw_lang"], since_dt, until_dt)
+                    since_dt = (dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+                                - dt.timedelta(hours=current_params["tw_hours"]))
+                    until_dt = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+
+                    q_api = _build_query_for_api(current_params["tw_query"], current_params["tw_lang"])
+                    q_sns = _build_query_for_snscrape(current_params["tw_query"], current_params["tw_lang"], since_dt, until_dt)
 
                     tweets: List[Dict[str, Any]] = []
                     use_api = False
@@ -1505,7 +1560,6 @@ if run_btn:
                     elif current_params["tw_method"] == "snscrape":
                         use_sns = True
                     else:
-                        # Auto: prefer API if token exists; else snscrape if installed
                         if get_twitter_bearer():
                             use_api = True
                         elif _snscrape_available():
@@ -1514,12 +1568,14 @@ if run_btn:
                     if use_api and get_twitter_bearer():
                         tweets = fetch_tweets_via_api(
                             bearer=get_twitter_bearer(),
-                            query=q,
+                            query=q_api,
+                            start_time=since_dt,
+                            end_time=until_dt,
                             max_results=current_params["tw_max"]
                         )
                     elif use_sns:
                         tweets = fetch_tweets_via_snscrape(
-                            query=q,
+                            query=q_sns,
                             max_results=current_params["tw_max"]
                         )
                     else:
@@ -1558,6 +1614,5 @@ if df is None:
 - 🐦 (Optional) Collects and analyzes **Twitter/X sentiment** for your query/time window
     """)
 else:
-    # Use the stored results; do NOT recompute unless Scan Now was clicked
     ui_results(df, top_k=st.session_state.get("last_scan_params", {}).get("top_k", 12),
                sent_df=sent_df, sent_summary=sent_summary)
