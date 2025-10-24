@@ -5,10 +5,13 @@
 import os
 import re
 import html
+import json
 import hashlib
 import datetime as dt
 from typing import List, Dict, Tuple, Optional, Any
 from urllib.parse import urlparse, urljoin
+import subprocess
+import math
 
 import numpy as np
 import pandas as pd
@@ -56,6 +59,19 @@ try:
 except Exception:
     HAS_SK = False
     logger.info("sklearn not available; falling back to keyword hit scoring.")
+
+# ========================= Optional NLTK VADER for sentiment =========================
+HAS_VADER = True
+try:
+    import nltk
+    from nltk.sentiment import SentimentIntensityAnalyzer
+    try:
+        _ = nltk.data.find("sentiment/vader_lexicon.zip")
+    except LookupError:
+        nltk.download("vader_lexicon")
+except Exception as e:
+    HAS_VADER = False
+    logger.info(f"VADER not available: {e}")
 
 # ========================= App Strings / Theme =========================
 APP_NAME = "One Africa Market Pulse"
@@ -220,6 +236,10 @@ def get_newsdata_api_key() -> str:
 
 def get_openai_api_key() -> str:
     return _get_secret_safely("OPENAI_API_KEY")
+
+def get_twitter_bearer() -> str:
+    # X/Twitter v2 bearer token if available
+    return _get_secret_safely("TWITTER_BEARER_TOKEN") or _get_secret_safely("X_BEARER_TOKEN")
 
 # ========================= HTTP utils + safe wrappers =========================
 def get_session() -> requests.Session:
@@ -612,6 +632,142 @@ def fetch_from_newsdata(
             continue
     return items
 
+# ========================= Social Sentiment (Twitter/X) =========================
+def _build_twitter_query(base_query: str, lang: str, since_dt: dt.datetime, until_dt: dt.datetime) -> str:
+    parts = [base_query]
+    if lang:
+        parts.append(f"lang:{lang}")
+    if since_dt:
+        parts.append(f"since:{since_dt.strftime('%Y-%m-%d')}")
+    if until_dt:
+        # X search uses "until:" as exclusive next day; we pass next-day date to include until_dt
+        parts.append(f"until:{(until_dt + dt.timedelta(days=1)).strftime('%Y-%m-%d')}")
+    return " ".join(parts).strip()
+
+def _snscrape_available() -> bool:
+    try:
+        res = subprocess.run(["snscrape", "--help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return (res.returncode == 0)
+    except Exception:
+        return False
+
+def fetch_tweets_via_api(bearer: str, query: str, max_results: int = 100) -> List[Dict[str, Any]]:
+    """Twitter/X v2 recent search."""
+    items: List[Dict[str, Any]] = []
+    if not bearer:
+        return items
+    url = "https://api.twitter.com/2/tweets/search/recent"
+    headers = {"Authorization": f"Bearer {bearer}"}
+    params = {
+        "query": query,
+        "max_results": min(100, max(10, max_results)),
+        "tweet.fields": "created_at,lang,public_metrics",
+    }
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=20)
+        if r.status_code != 200:
+            soft_fail("Twitter API call failed.", f"twitter api {r.status_code} {r.text[:200]}")
+            return items
+        data = r.json()
+        for t in data.get("data", []):
+            items.append({
+                "id": t.get("id"),
+                "created_at": t.get("created_at"),
+                "text": t.get("text", ""),
+                "lang": t.get("lang"),
+                "retweets": t.get("public_metrics", {}).get("retweet_count", 0),
+                "likes": t.get("public_metrics", {}).get("like_count", 0),
+            })
+    except Exception as e:
+        soft_fail("Twitter API not reachable.", f"twitter api EXC {e}")
+    return items[:max_results]
+
+def fetch_tweets_via_snscrape(query: str, max_results: int = 200) -> List[Dict[str, Any]]:
+    """Use snscrape CLI (pip install snscrape)."""
+    items: List[Dict[str, Any]] = []
+    if not _snscrape_available():
+        soft_fail("snscrape is not installed.", "Install with: pip install snscrape")
+        return items
+    cmd = ["snscrape", "--max-results", str(max_results), "--jsonl", "twitter-search", query]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        for line in proc.stdout:
+            try:
+                j = json.loads(line.strip())
+                items.append({
+                    "id": j.get("id"),
+                    "created_at": j.get("date"),
+                    "text": j.get("content", ""),
+                    "lang": j.get("lang"),
+                    "retweets": j.get("retweetCount", 0),
+                    "likes": j.get("likeCount", 0),
+                    "username": j.get("user", {}).get("username"),
+                    "url": j.get("url")
+                })
+            except Exception:
+                continue
+        proc.wait(timeout=10)
+    except Exception as e:
+        soft_fail("snscrape search failed.", f"snscrape EXC {e}")
+    return items
+
+def get_sentiment_analyzer():
+    if not HAS_VADER:
+        return None
+    try:
+        return SentimentIntensityAnalyzer()
+    except Exception as e:
+        soft_fail("VADER analyzer unavailable.", f"vader EXC {e}")
+        return None
+
+def analyze_tweet_sentiment(tweets: List[Dict[str, Any]]) -> pd.DataFrame:
+    if not tweets:
+        return pd.DataFrame(columns=["created_at","text","compound","label","retweets","likes","username","url"])
+    sia = get_sentiment_analyzer()
+    rows = []
+    for t in tweets:
+        text = _normalize(t.get("text",""))
+        if not text:
+            continue
+        if sia:
+            sc = sia.polarity_scores(text).get("compound", 0.0)
+        else:
+            sc = 0.0
+        label = "Neutral"
+        if sc >= 0.05:
+            label = "Positive"
+        elif sc <= -0.05:
+            label = "Negative"
+        rows.append({
+            "created_at": t.get("created_at"),
+            "text": text,
+            "compound": sc,
+            "label": label,
+            "retweets": t.get("retweets", 0),
+            "likes": t.get("likes", 0),
+            "username": t.get("username", ""),
+            "url": t.get("url", ""),
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        # sort newest first
+        try:
+            df["created_at"] = pd.to_datetime(df["created_at"])
+            df = df.sort_values("created_at", ascending=False).reset_index(drop=True)
+        except Exception:
+            pass
+    return df
+
+def summarize_sentiment(df: pd.DataFrame) -> Dict[str, Any]:
+    if df is None or df.empty:
+        return {"n": 0, "mean_compound": 0.0, "share_pos": 0.0, "share_neu": 0.0, "share_neg": 0.0}
+    n = len(df)
+    mean_c = float(df["compound"].mean())
+    share_pos = float((df["label"] == "Positive").mean())
+    share_neu = float((df["label"] == "Neutral").mean())
+    share_neg = float((df["label"] == "Negative").mean())
+    return {"n": n, "mean_compound": mean_c, "share_pos": share_pos, "share_neu": share_neu, "share_neg": share_neg}
+
 # ========================= UI Helpers =========================
 st.set_page_config(page_title=APP_NAME, page_icon="🌍", layout="wide", initial_sidebar_state="expanded")
 st.markdown(CARD_CSS, unsafe_allow_html=True)
@@ -646,15 +802,19 @@ with st.container():
 
 # ======= ACTION BAR =======
 st.markdown("<br>", unsafe_allow_html=True)
-act_b1, act_b2 = st.columns([1, 1])
+act_b1, act_b2, act_b3 = st.columns([1, 1, 1])
 with act_b1:
     run_btn = st.button("🚀 Scan Now", use_container_width=True, key="run_main")
 with act_b2:
     if st.button("♻️ Reset", use_container_width=True, key="reset_main"):
         # Only clear our app's keys; keep secrets & Streamlit internals intact
         for k in list(st.session_state.keys()):
-            if k.startswith(("results_", "ai_", "chat_", "cfg_", "last_scan_", "filters_")):
+            if k.startswith(("results_", "ai_", "chat_", "cfg_", "last_scan_", "filters_", "sent_")):
                 del st.session_state[k]
+        st.rerun()
+with act_b3:
+    # lightweight re-render without recompute (useful if layout glitched)
+    if st.button("🔄 Refresh View", use_container_width=True, key="refresh_view"):
         st.rerun()
 
 # ======= Quick Analyze by URL (LLM-only) =======
@@ -787,6 +947,8 @@ with st.sidebar:
         key_present = "Yes" if get_openai_api_key() else "No"
         st.write(f"OPENAI_API_KEY present: **{key_present}**")
         st.write(f"OPENAI_BASE_URL: **{os.environ.get('OPENAI_BASE_URL','(not set)')}**")
+        tw_present = "Yes" if get_twitter_bearer() else "No"
+        st.write(f"TWITTER_BEARER_TOKEN present: **{tw_present}**")
         if st.button("Run AI self-test"):
             if not have_openai():
                 st.error("No OPENAI_API_KEY or package not installed.")
@@ -941,6 +1103,24 @@ with st.sidebar:
 
         st.markdown("---")
 
+        # 🐦 Social Sentiment (Twitter/X)
+        st.subheader("🐦 Social Sentiment (Twitter/X)")
+        enable_social = st.checkbox("Enable Twitter/X sentiment", value=True, key="enable_social")
+        method = st.radio("Method", ["Auto", "Twitter API (v2)", "snscrape"], horizontal=True, key="tw_method")
+        default_query = " OR ".join([kw for kw in keywords if " " not in kw][:6]) or "cashew OR shea OR cocoa"
+        tw_query = st.text_input("Twitter search query", value=default_query, help="Example: cashew OR shea OR cocoa", key="tw_query")
+        col_t1, col_t2, col_t3 = st.columns(3)
+        with col_t1:
+            tw_hours = st.number_input("Lookback hours", min_value=6, max_value=720, value=72, step=6, key="tw_hours")
+        with col_t2:
+            tw_lang = st.text_input("Language filter (e.g., en, fr) or blank", value="en", key="tw_lang")
+        with col_t3:
+            tw_max = st.number_input("Max tweets", min_value=50, max_value=1000, value=300, step=50, key="tw_max")
+
+        st.caption("Tip: To use the API method, set TWITTER_BEARER_TOKEN in your .env/Secrets. For snscrape, install with `pip install snscrape`.")
+
+        st.markdown("---")
+
         # 🛡️ Resilience
         st.subheader("🛡️ Resilience")
         force_fetch = st.checkbox("⚡ Force RSS fetch if validation fails", value=True, key="force")
@@ -967,6 +1147,13 @@ current_params = {
     "force_fetch": bool(force_fetch),
     "ignore_recency": bool(ignore_recency),
     "dedupe": bool(dedupe_across_sources),
+    # Social
+    "enable_social": bool(enable_social),
+    "tw_method": method,
+    "tw_query": tw_query,
+    "tw_hours": int(tw_hours),
+    "tw_lang": tw_lang.strip(),
+    "tw_max": int(tw_max),
 }
 
 # ---- Durable stores (persist across reruns) ----
@@ -976,6 +1163,8 @@ ss_get("ai_analyses", {})                # dict card_key -> markdown
 ss_get("last_scan_params", {})           # dict of the last run inputs (window, keywords, etc.)
 ss_get("filters_impact", [])             # current impact filter
 ss_get("filters_source", [])             # current source filter
+ss_get("sent_df", None)                  # tweets df
+ss_get("sent_summary", {})               # sentiment summary
 
 # Quick Analyze trigger (uses LLM only)
 if run_quick:
@@ -1106,7 +1295,7 @@ def fetch_all(params: Dict[str, Any]) -> List[Dict[str, Any]]:
     info.empty()
     progress.empty()
 
-    # Optional cross-source de-duplication (already deduped by title+link, but keep option)
+    # Optional cross-source de-duplication
     if params.get("dedupe", True) and rows:
         seen = set()
         deduped = []
@@ -1181,60 +1370,90 @@ def render_card(row: pd.Series):
                             st.session_state["ai_analyses"][key] = md
                             st.markdown(md)
 
-def ui_results(df: pd.DataFrame, top_k: int):
+def ui_results(df: pd.DataFrame, top_k: int, sent_df: Optional[pd.DataFrame], sent_summary: Dict[str, Any]):
     st.subheader("📊 Results")
     if df.empty:
         st.warning("No relevant articles found. Try widening the date range or lowering the relevance threshold.")
-        return
+    else:
+        c1, c2 = st.columns(2)
+        with c1:
+            all_impacts = sorted({t for tags in df["impact"] for t in tags})
+            impact_filter = st.multiselect(
+                "Filter by impact",
+                options=all_impacts,
+                default=ss_get("filters_impact", []),
+                key="filters_impact"
+            )
+        with c2:
+            source_filter = st.multiselect(
+                "Filter by source",
+                options=sorted(df["source"].unique()),
+                default=ss_get("filters_source", []),
+                key="filters_source"
+            )
 
-    c1, c2 = st.columns(2)
-    with c1:
-        all_impacts = sorted({t for tags in df["impact"] for t in tags})
-        impact_filter = st.multiselect(
-            "Filter by impact",
-            options=all_impacts,
-            default=ss_get("filters_impact", []),
-            key="filters_impact"
-        )
-    with c2:
-        source_filter = st.multiselect(
-            "Filter by source",
-            options=sorted(df["source"].unique()),
-            default=ss_get("filters_source", []),
-            key="filters_source"
-        )
+        filtered = df.copy()
+        if impact_filter:
+            filtered = filtered[filtered["impact"].apply(lambda x: any(t in x for t in impact_filter))]
+        if source_filter:
+            filtered = filtered[filtered["source"].isin(source_filter)]
 
-    filtered = df.copy()
-    if impact_filter:
-        filtered = filtered[filtered["impact"].apply(lambda x: any(t in x for t in impact_filter))]
-    if source_filter:
-        filtered = filtered[filtered["source"].isin(source_filter)]
+        # Streamlit-native tiling
+        cards = list(filtered.to_dict("records"))
+        n = 3  # 3 columns
+        for i in range(0, len(cards), n):
+            cols = st.columns(n)
+            for j, col in enumerate(cols):
+                if i + j < len(cards):
+                    with col:
+                        render_card(pd.Series(cards[i + j]))
+            st.markdown("<br>", unsafe_allow_html=True)
 
-    # Streamlit-native tiling
-    cards = list(filtered.to_dict("records"))
-    n = 3  # 3 columns
-    for i in range(0, len(cards), n):
-        cols = st.columns(n)
-        for j, col in enumerate(cols):
-            if i + j < len(cards):
-                with col:
-                    render_card(pd.Series(cards[i + j]))
-        st.markdown("<br>", unsafe_allow_html=True)
+        st.subheader("📝 Daily Digest")
+        digest_md = make_digest(filtered if (impact_filter or source_filter) else df, top_k=top_k)
+        st.markdown(digest_md)
 
-    st.subheader("📝 Daily Digest")
-    digest_md = make_digest(filtered if (impact_filter or source_filter) else df, top_k=top_k)
-    st.markdown(digest_md)
+        st.subheader("⬇️ Downloads")
+        ts = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        export_df = filtered if (impact_filter or source_filter) else df
+        csv_name = f"oneafrica_pulse_{ts}.csv"
+        md_name = f"oneafrica_pulse_digest_{ts}.md"
+        st.download_button("📥 Download CSV", data=export_df.to_csv(index=False).encode("utf-8"),
+                           file_name=csv_name, mime="text/csv")
+        st.download_button("📥 Download Digest (Markdown)", data=digest_md.encode("utf-8"),
+                           file_name=md_name, mime="text/markdown")
+        st.info("💡 Tip: Paste the Markdown into an email, WhatsApp (as a code block), or your wiki for quick sharing.")
 
-    st.subheader("⬇️ Downloads")
-    ts = dt.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    export_df = filtered if (impact_filter or source_filter) else df
-    csv_name = f"oneafrica_pulse_{ts}.csv"
-    md_name = f"oneafrica_pulse_digest_{ts}.md"
-    st.download_button("📥 Download CSV", data=export_df.to_csv(index=False).encode("utf-8"),
-                       file_name=csv_name, mime="text/csv")
-    st.download_button("📥 Download Digest (Markdown)", data=digest_md.encode("utf-8"),
-                       file_name=md_name, mime="text/markdown")
-    st.info("💡 Tip: Paste the Markdown into an email, WhatsApp (as a code block), or your wiki for quick sharing.")
+    # -------- Social Sentiment Section --------
+    st.markdown("---")
+    st.subheader("🐦 Social Sentiment — Twitter/X")
+    if (sent_df is None) or (sent_df is not None and sent_df.empty):
+        st.caption("No tweets captured for the current window/query. Enable in the sidebar and click **Scan Now**.")
+    else:
+        met1, met2, met3, met4 = st.columns(4)
+        with met1:
+            st.metric("Tweets analyzed", int(sent_summary.get("n", 0)))
+        with met2:
+            st.metric("Mean sentiment (compound)", f"{sent_summary.get('mean_compound', 0.0):+.3f}")
+        with met3:
+            st.metric("Positive", f"{100*sent_summary.get('share_pos',0.0):.1f}%")
+        with met4:
+            st.metric("Negative", f"{100*sent_summary.get('share_neg',0.0):.1f}%")
+
+        # Simple bar share
+        share_df = pd.DataFrame({
+            "label": ["Positive","Neutral","Negative"],
+            "share": [
+                100*sent_summary.get("share_pos",0.0),
+                100*sent_summary.get("share_neu",0.0),
+                100*sent_summary.get("share_neg",0.0),
+            ]
+        })
+        st.bar_chart(data=share_df, x="label", y="share", use_container_width=True)
+
+        with st.expander("See recent tweets"):
+            show_cols = ["created_at","label","compound","text","likes","retweets","username","url"]
+            st.dataframe(sent_df[show_cols], use_container_width=True, height=320)
 
 def friendly_error_summary():
     if not SOFT_ERRORS:
@@ -1266,10 +1485,54 @@ if run_btn:
                 rows = fetch_all(current_params)
                 df = process_rows(rows)
 
-                # Persist results so they survive reruns
+                # Persist news results so they survive reruns
                 st.session_state["results_df"] = df
                 st.session_state["results_digest_md"] = make_digest(df, top_k=current_params["top_k"])
                 st.session_state["last_scan_params"] = current_params
+
+            # ---------- Social Sentiment pass (optional) ----------
+            if current_params["enable_social"]:
+                with st.spinner("Collecting and analyzing Twitter/X sentiment..."):
+                    since_dt = dt.datetime.utcnow() - dt.timedelta(hours=current_params["tw_hours"])
+                    until_dt = dt.datetime.utcnow()
+                    q = _build_twitter_query(current_params["tw_query"], current_params["tw_lang"], since_dt, until_dt)
+
+                    tweets: List[Dict[str, Any]] = []
+                    use_api = False
+                    use_sns = False
+                    if current_params["tw_method"] == "Twitter API (v2)":
+                        use_api = True
+                    elif current_params["tw_method"] == "snscrape":
+                        use_sns = True
+                    else:
+                        # Auto: prefer API if token exists; else snscrape if installed
+                        if get_twitter_bearer():
+                            use_api = True
+                        elif _snscrape_available():
+                            use_sns = True
+
+                    if use_api and get_twitter_bearer():
+                        tweets = fetch_tweets_via_api(
+                            bearer=get_twitter_bearer(),
+                            query=q,
+                            max_results=current_params["tw_max"]
+                        )
+                    elif use_sns:
+                        tweets = fetch_tweets_via_snscrape(
+                            query=q,
+                            max_results=current_params["tw_max"]
+                        )
+                    else:
+                        soft_fail("No Twitter method available.",
+                                  "Provide TWITTER_BEARER_TOKEN for API or install snscrape.")
+
+                    df_t = analyze_tweet_sentiment(tweets)
+                    summ = summarize_sentiment(df_t)
+                    st.session_state["sent_df"] = df_t
+                    st.session_state["sent_summary"] = summ
+            else:
+                st.session_state["sent_df"] = pd.DataFrame()
+                st.session_state["sent_summary"] = {"n": 0, "mean_compound": 0.0, "share_pos": 0.0, "share_neu": 0.0, "share_neg": 0.0}
 
     except Exception as e:
         soft_fail("Something went wrong while assembling the results.", f"MAIN EXC {e}")
@@ -1280,6 +1543,8 @@ if run_btn:
 # Render either the newly saved results or the last good results
 df = st.session_state.get("results_df", None)
 digest_md = st.session_state.get("results_digest_md", "")
+sent_df = st.session_state.get("sent_df", None)
+sent_summary = st.session_state.get("sent_summary", {})
 
 if df is None:
     st.info("""
@@ -1290,7 +1555,9 @@ if df is None:
 - 📝 Auto-summarizes into 2–6 sentences  
 - 🏷️ Tags each item (Supply Risk, FX & Policy, Logistics, etc.)  
 - 💾 Outputs a **downloadable CSV** and **Daily Digest (Markdown)**
+- 🐦 (Optional) Collects and analyzes **Twitter/X sentiment** for your query/time window
     """)
 else:
     # Use the stored results; do NOT recompute unless Scan Now was clicked
-    ui_results(df, top_k=st.session_state.get("last_scan_params", {}).get("top_k", 12))
+    ui_results(df, top_k=st.session_state.get("last_scan_params", {}).get("top_k", 12),
+               sent_df=sent_df, sent_summary=sent_summary)
