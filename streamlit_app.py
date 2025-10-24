@@ -671,6 +671,21 @@ def _to_iso8601_z(ts: dt.datetime) -> str:
         ts = ts.astimezone(dt.timezone.utc)
     return ts.isoformat().replace("+00:00", "Z")
 
+def _clamp_to_recent_window(start_dt: dt.datetime, end_dt: dt.datetime) -> Tuple[dt.datetime, dt.datetime]:
+    """
+    Twitter v2 recent search only covers ~7 days.
+    If the chosen window exceeds that, clamp start to (end - 6 days 23h).
+    Ensure tz-aware UTC.
+    """
+    def _to_utc(x):
+        return (x.replace(tzinfo=dt.timezone.utc) if x.tzinfo is None else x.astimezone(dt.timezone.utc))
+    end_dt = _to_utc(end_dt)
+    start_dt = _to_utc(start_dt)
+    max_span = dt.timedelta(days=6, hours=23)  # a hair under 7 days
+    if end_dt - start_dt > max_span:
+        start_dt = end_dt - max_span
+    return start_dt, end_dt
+
 def fetch_tweets_via_api(
     bearer: str,
     query: str,
@@ -681,13 +696,20 @@ def fetch_tweets_via_api(
     """
     Twitter/X v2 recent search with pagination and user expansion.
     Uses start_time/end_time params instead of since:/until: operators.
+    Verbose soft_fail messages if errors or zero results.
     """
     items: List[Dict[str, Any]] = []
     if not bearer:
+        soft_fail("Twitter API token missing.", "Set TWITTER_BEARER_TOKEN in .env or secrets.toml")
         return items
 
+    start_time, end_time = _clamp_to_recent_window(start_time, end_time)
+
     url = "https://api.twitter.com/2/tweets/search/recent"
-    headers = {"Authorization": f"Bearer {bearer}"}
+    headers = {
+        "Authorization": f"Bearer {bearer}",
+        "User-Agent": "OneAfricaPulse/1.0"
+    }
 
     page_size = min(100, max(10, max_results))
     next_token = None
@@ -710,7 +732,8 @@ def fetch_tweets_via_api(
         try:
             r = requests.get(url, headers=headers, params=params, timeout=20)
             if r.status_code != 200:
-                soft_fail("Twitter API call failed.", f"twitter api {r.status_code} {r.text[:200]}")
+                txt = r.text[:300].replace("\n", " ")
+                soft_fail("Twitter API call failed.", f"twitter api {r.status_code} {txt}")
                 break
 
             data = r.json()
@@ -718,6 +741,11 @@ def fetch_tweets_via_api(
                 user_map[u.get("id")] = u
 
             batch = data.get("data", []) or []
+            if not batch and not data.get("meta", {}).get("next_token"):
+                soft_fail("Twitter returned zero results.",
+                          f"Query='{query}' window={start_time.isoformat()}→{end_time.isoformat()}")
+                break
+
             for t in batch:
                 au = user_map.get(t.get("author_id") or "", {})
                 items.append({
@@ -737,6 +765,7 @@ def fetch_tweets_via_api(
             next_token = data.get("meta", {}).get("next_token")
             if not next_token:
                 break
+
         except Exception as e:
             soft_fail("Twitter API not reachable.", f"twitter api EXC {e}")
             break
@@ -1026,6 +1055,29 @@ with st.sidebar:
                         st.success(f"LLM replied: {msg[:200]}")
                     except Exception as e:
                         st.error(f"Model call failed: {e}")
+
+        st.markdown("---")
+        st.write("**Twitter connectivity quick test**")
+        if st.button("Run Twitter Test"):
+            bearer = get_twitter_bearer()
+            if not bearer:
+                st.error("No TWITTER_BEARER_TOKEN found. Put it in `.env` or `secrets.toml`.")
+            else:
+                try:
+                    url = "https://api.twitter.com/2/tweets/search/recent"
+                    params = {"query": "news -is:retweet", "max_results": 10}
+                    r = requests.get(url, headers={"Authorization": f"Bearer {bearer}"}, params=params, timeout=15)
+                    st.write(f"HTTP {r.status_code}")
+                    txt = r.text[:500]
+                    st.code(txt)
+                    if r.status_code == 401:
+                        st.warning("401 Unauthorized: token invalid/expired or project lacks access.")
+                    elif r.status_code == 403:
+                        st.warning("403 Forbidden: your project tier may not have recent search access.")
+                    elif r.status_code == 429:
+                        st.warning("429 Rate limit: too many requests in your tier window.")
+                except Exception as e:
+                    st.error(f"Request failed: {e}")
 
 # ========================= LLM-only Article Analysis =========================
 @st.cache_data(ttl=30*60, show_spinner=False)
@@ -1545,42 +1597,44 @@ if run_btn:
             # ---------- Social Sentiment pass (optional) ----------
             if current_params["enable_social"]:
                 with st.spinner("Collecting and analyzing Twitter/X sentiment..."):
-                    since_dt = (dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
-                                - dt.timedelta(hours=current_params["tw_hours"]))
+                    since_dt = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc) - dt.timedelta(hours=current_params["tw_hours"])
                     until_dt = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
+                    # Clamp to ≤7 days for API
+                    api_start, api_end = _clamp_to_recent_window(since_dt, until_dt)
 
                     q_api = _build_query_for_api(current_params["tw_query"], current_params["tw_lang"])
                     q_sns = _build_query_for_snscrape(current_params["tw_query"], current_params["tw_lang"], since_dt, until_dt)
 
                     tweets: List[Dict[str, Any]] = []
-                    use_api = False
-                    use_sns = False
-                    if current_params["tw_method"] == "Twitter API (v2)":
-                        use_api = True
-                    elif current_params["tw_method"] == "snscrape":
-                        use_sns = True
-                    else:
-                        if get_twitter_bearer():
-                            use_api = True
-                        elif _snscrape_available():
-                            use_sns = True
+                    tried_api = False
 
-                    if use_api and get_twitter_bearer():
+                    # Decide primary path
+                    prefer_api = (current_params["tw_method"] == "Twitter API (v2)") or (
+                        current_params["tw_method"] == "Auto" and get_twitter_bearer()
+                    )
+                    prefer_sns = (current_params["tw_method"] == "snscrape") or (
+                        current_params["tw_method"] == "Auto" and not get_twitter_bearer() and _snscrape_available()
+                    )
+
+                    if prefer_api and get_twitter_bearer():
+                        tried_api = True
                         tweets = fetch_tweets_via_api(
                             bearer=get_twitter_bearer(),
                             query=q_api,
-                            start_time=since_dt,
-                            end_time=until_dt,
+                            start_time=api_start,
+                            end_time=api_end,
                             max_results=current_params["tw_max"]
                         )
-                    elif use_sns:
-                        tweets = fetch_tweets_via_snscrape(
-                            query=q_sns,
-                            max_results=current_params["tw_max"]
-                        )
-                    else:
-                        soft_fail("No Twitter method available.",
-                                  "Provide TWITTER_BEARER_TOKEN for API or install snscrape.")
+
+                    # Fallback if API produced nothing (or user selected snscrape)
+                    if (not tweets) and (prefer_sns or not tried_api):
+                        if _snscrape_available():
+                            tweets = fetch_tweets_via_snscrape(
+                                query=q_sns,
+                                max_results=current_params["tw_max"]
+                            )
+                        else:
+                            soft_fail("snscrape not installed.", "pip install snscrape")
 
                     df_t = analyze_tweet_sentiment(tweets)
                     summ = summarize_sentiment(df_t)
