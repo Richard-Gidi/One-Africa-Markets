@@ -90,19 +90,13 @@ DEFAULT_KEYWORDS = [
     "west africa", "sahel", "trade policy", "commodity", "price", "market"
 ]
 
-# Curated working RSS/Atom sources
+# Curated working RSS/Atom sources (FIX: Removed invalid/404 feeds based on checks)
 DEFAULT_SOURCES = {
     "AllAfrica » Agriculture": "https://allafrica.com/tools/headlines/rdf/agriculture/headlines.rdf",
     "AllAfrica » Business": "https://allafrica.com/tools/headlines/rdf/business/headlines.rdf",
-    "The Standard » Business": "https://www.standardmedia.co.ke/rss/business.php",
-    "The Standard » Agriculture": "https://www.standardmedia.co.ke/rss/agriculture.php",
-    "CitiNewsroom": "https://citinewsroom.com/feed/",
-    "FAO News (All topics)": "https://www.fao.org/news/rss/en",
-    "FAO GIEWS": "https://www.fao.org/giews/rss/en/",
     "FreshPlaza Africa": "https://www.freshplaza.com/africa/rss.xml",
     "African Arguments": "https://africanarguments.org/feed/",
     "How We Made It In Africa": "https://www.howwemadeitinafrica.com/feed/",
-    "Bizcommunity (Africa • Agri+Logistics)": "https://www.bizcommunity.com/GenerateRss.aspx?i=63,76&c=81",
 }
 
 IMPACT_RULES = {
@@ -378,10 +372,9 @@ def simple_extractive_summary(text: str, n_sentences: int = 3, keywords: Optiona
     if HAS_SK:
         try:
             vec = TfidfVectorizer(stop_words="english", max_features=8000)
-            X = vec.fit_transform(sents)  # sparse
-            # centroid as 1D numpy array (avoid np.matrix warnings)
-            centroid = np.asarray(X.mean(axis=0)).ravel()
-            sims = cosine_similarity(X, centroid.reshape(1, -1)).ravel()
+            X = vec.fit_transform(sents)
+            centroid = X.mean(axis=0)
+            sims = cosine_similarity(X, centroid).ravel()
             if keywords:
                 kw = [k.lower() for k in keywords]
                 boost = np.array([sum(1 for w in re.findall(r"[a-z']+", s.lower()) if w in kw) for s in sents], dtype=float)
@@ -456,14 +449,11 @@ def parse_feed_xml(content: bytes, base_url: str) -> List[Dict[str, str]]:
     items: List[Dict[str, str]] = []
     if not content:
         return items
-    # Quick sanity: ensure XML-ish
-    try:
-        sample = content.lstrip()[:16]
-        if not sample.startswith(b"<") and not sample.startswith(b"\xef\xbb\xbf<"):
-            soft_fail("Skipped one feed that returned non-XML.", f"parse_feed_xml non-xml from {base_url}")
-            return items
-    except Exception:
-        pass
+    # FIX: Strip BOM and check if looks like XML
+    content = content.lstrip(b'\xef\xbb\xbf')
+    if not content.startswith(b'<'):
+        soft_fail("Skipped non-XML feed content.", f"parse_feed_xml non-xml start from {base_url}: {content[:50]}")
+        return items
     try:
         root = ET.fromstring(content)
         channel = root.find("channel")
@@ -497,7 +487,7 @@ def parse_feed_xml(content: bytes, base_url: str) -> List[Dict[str, str]]:
                 items.append({"title": title, "link": link, "summary": summary, "published_raw": pub})
         return items
     except Exception as e:
-        soft_fail("Skipped one feed that had invalid XML.", f"parse_feed_xml EXC {e}")
+        soft_fail("Skipped one feed that had invalid XML.", f"parse_feed_xml EXC {base_url}: {e} content_start={content[:100]}")
         return items
 
 def validate_feed(url: str, ignore_recency_check: bool = False) -> Tuple[bool, str]:
@@ -691,7 +681,7 @@ def _parse_rate_limit_headers(resp) -> Tuple[int,int,int]:
     except Exception: reset = -1
     return limit, remaining, reset
 
-def _sleep_until_reset(reset_unix: int, cap_seconds: int = 30) -> int:
+def _sleep_until_reset(reset_unix: int, cap_seconds: int = 60) -> int:  # FIX: Increased cap to 60s for longer waits
     if reset_unix is None or reset_unix < 0:
         return 0
     now = int(time.time())
@@ -765,7 +755,7 @@ def fetch_tweets_via_api(
 
     url = "https://api.twitter.com/2/tweets/search/recent"
     headers = {"Authorization": f"Bearer {bearer}", "User-Agent": "OneAfricaPulse/1.0"}
-    page_size = min(100, max(10, max_results))
+    page_size = min(100, max(10, max_results // 3 + 1))  # FIX: Smaller page size to reduce rate hits
     next_token = None
     fetched = 0
     user_map: Dict[str, Dict[str, Any]] = {}
@@ -795,7 +785,7 @@ def fetch_tweets_via_api(
                       f"limit={limit} remaining={remaining} reset_unix={reset_unix}")
             if not tried_retry_on_429:
                 tried_retry_on_429 = True
-                slept = _sleep_until_reset(reset_unix, cap_seconds=30)
+                slept = _sleep_until_reset(reset_unix, cap_seconds=60)  # FIX: Increased cap
                 if slept > 0:
                     r = _one_page(next_token)
                     if r.status_code == 429:
@@ -1117,7 +1107,7 @@ with st.sidebar:
                     if r.status_code == 401:
                         st.warning("401 Unauthorized: token invalid/expired or project lacks access.")
                     elif r.status_code == 403:
-                        st.warning("403 Forbidden: your project tier may not have recent search access.")
+                        st.warning("403 Forbidden: your project tier may not have recent search access. Consider upgrading to Basic tier.")
                     elif r.status_code == 429:
                         st.warning("429 Rate limit: reduce frequency/max_results, or wait for reset.")
                 except Exception as e:
@@ -1247,7 +1237,6 @@ with st.sidebar:
         custom_kw = st.text_area("Keywords (comma-separated)", ", ".join(DEFAULT_KEYWORDS), height=100, key="kw_text")
         keywords = [k.strip() for k in custom_kw.split(",") if k.strip()]
         min_relevance = st.number_input("Min relevance (0.00–1.00)", min_value=0.0, max_value=1.0, value=0.05, step=0.01, format="%.2f", key="min_rel")
-        # Default set to 10 as requested
         per_source_cap = st.number_input("Max articles per source", min_value=1, max_value=200, value=10, step=1, key="cap")
 
         st.markdown("---")
@@ -1271,9 +1260,9 @@ with st.sidebar:
         with col_t2:
             tw_lang = st.text_input("Language filter (e.g., en, fr) or blank", value="en", key="tw_lang")
         with col_t3:
-            tw_max = st.number_input("Max tweets", min_value=10, max_value=1000, value=300, step=50, key="tw_max")
+            tw_max = st.number_input("Max tweets", min_value=10, max_value=1000, value=100, step=50, key="tw_max")  # FIX: Reduced default to 100 to avoid rate limits
 
-        st.caption("Tip: To use the API method, set TWITTER_BEARER_TOKEN in your .env/Secrets. For snscrape, install with `pip install snscrape`.")
+        st.caption("Tip: To use the API method, set TWITTER_BEARER_TOKEN in your .env/Secrets. For snscrape, install with `pip install snscrape`. For Basic tier, keep max tweets low to avoid rate limits.")
 
         st.markdown("---")
 
@@ -1580,6 +1569,7 @@ def ui_results(df: pd.DataFrame, top_k: int, sent_df: Optional[pd.DataFrame], se
     st.subheader("🐦 Social Sentiment — Twitter/X")
     if (sent_df is None) or (sent_df is not None and sent_df.empty):
         st.caption("No tweets captured for the current window/query. Enable in the sidebar and click **Scan Now**.")
+        st.warning("If using Twitter API, check diagnostics for rate limits or access issues. Consider reducing max tweets or waiting for reset.")
     else:
         met1, met2, met3, met4 = st.columns(4)
         with met1:
