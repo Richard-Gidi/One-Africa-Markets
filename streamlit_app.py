@@ -1130,7 +1130,7 @@ def _llm_analyze_article_cached(model: str, title: str, body: str, tags: List[st
     if client is None:
         return ""
     prompt = f"""
-You are a market-intelligence analyst focused on West African agri value chains
+You are a market-intelligence analyst focused on tree crop commodities in the world
 (cashew, shea, cocoa, palm kernel), logistics, and FX.
 
 Analyze the ARTICLE and produce a concise, executive-ready brief. Use short, punchy bullets
