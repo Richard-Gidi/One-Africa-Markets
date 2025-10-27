@@ -9,3 +9,5 @@ python-dotenv
 openai==1.*
 snscrape
 nltk
+python-docx
+lxml
