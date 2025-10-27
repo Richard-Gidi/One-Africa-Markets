@@ -10,7 +10,6 @@ import hashlib
 import datetime as dt
 from typing import List, Dict, Tuple, Optional, Any
 from urllib.parse import urlparse, urljoin
-import subprocess
 import math
 import time  # NEW: for rate-limit sleep
 
@@ -25,6 +24,9 @@ from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 import xml.etree.ElementTree as ET
 import logging
+
+# NEW: For Grok integration (using openai-compatible client)
+from openai import OpenAI
 
 # ==== resilient .env loader ====
 try:
@@ -241,6 +243,9 @@ def get_openai_api_key() -> str:
 def get_twitter_bearer() -> str:
     # X/Twitter v2 bearer token if available
     return _get_secret_safely("TWITTER_BEARER_TOKEN") or _get_secret_safely("X_BEARER_TOKEN")
+
+def get_xai_api_key() -> str:
+    return _get_secret_safely("XAI_API_KEY")
 
 # ========================= HTTP utils + safe wrappers =========================
 def get_session() -> requests.Session:
@@ -642,206 +647,130 @@ def fetch_from_newsdata(
             continue
     return items
 
-# ========================= Social Sentiment (Twitter/X) =========================
-def _to_iso8601_z(ts: dt.datetime) -> str:
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=dt.timezone.utc)
-    else:
-        ts = ts.astimezone(dt.timezone.utc)
-    return ts.isoformat().replace("+00:00", "Z")
+# ========================= NEW: Grok-based X Fetch and Sentiment =========================
+def fetch_tweets_via_grok(query: str, lang: str, hours: int, max_results: int = 300) -> List[Dict[str, Any]]:
+    api_key = get_xai_api_key()
+    if not api_key:
+        soft_fail("XAI_API_KEY missing for Grok integration.", "Set XAI_API_KEY in .env or secrets.")
+        return []
 
-def _clamp_to_recent_window(start_dt: dt.datetime, end_dt: dt.datetime) -> Tuple[dt.datetime, dt.datetime]:
-    """
-    Twitter v2 recent search only covers ~7 days.
-    If the chosen window exceeds that, clamp start to (end - 6 days 23h).
-    Ensure tz-aware UTC.
-    """
-    def _to_utc(x):
-        return (x.replace(tzinfo=dt.timezone.utc) if x.tzinfo is None else x.astimezone(dt.timezone.utc))
-    end_dt = _to_utc(end_dt)
-    start_dt = _to_utc(start_dt)
-    max_span = dt.timedelta(days=6, hours=23)
-    if end_dt - start_dt > max_span:
-        start_dt = end_dt - max_span
-    return start_dt, end_dt
+    client = OpenAI(api_key=api_key, base_url="https://api.x.ai/v1")
 
-def _build_query_for_api(base_query: str, lang: str) -> str:
-    parts = [base_query.strip()]
-    if lang:
-        parts.append(f"lang:{lang.strip()}")
-    parts += ["-is:retweet", "-is:reply", "-is:quote"]
-    return " ".join([p for p in parts if p])
-
-def _build_query_for_snscrape(base_query: str, lang: str,
-                              since_dt: dt.datetime, until_dt: dt.datetime) -> str:
-    parts = [base_query.strip()]
-    if lang:
-        parts.append(f"lang:{lang.strip()}")
-    parts.append(f"since:{since_dt.strftime('%Y-%m-%d')}")
-    parts.append(f"until:{(until_dt + dt.timedelta(days=1)).strftime('%Y-%m-%d')}")
-    parts += ["-is:retweet", "-is:reply", "-is:quote"]
-    return " ".join([p for p in parts if p])
-
-def _parse_rate_limit_headers(resp) -> Tuple[int,int,int]:
-    try: limit = int(resp.headers.get("x-rate-limit-limit", "-1"))
-    except Exception: limit = -1
-    try: remaining = int(resp.headers.get("x-rate-limit-remaining", "-1"))
-    except Exception: remaining = -1
-    try: reset = int(resp.headers.get("x-rate-limit-reset", "-1"))
-    except Exception: reset = -1
-    return limit, remaining, reset
-
-def _sleep_until_reset(reset_unix: int, cap_seconds: int = 30) -> int:
-    if reset_unix is None or reset_unix < 0:
-        return 0
-    now = int(time.time())
-    wait = max(0, reset_unix - now)
-    wait = min(wait, cap_seconds)
-    if wait > 0:
-        time.sleep(wait)
-    return wait
-
-def _snscrape_available() -> bool:
-    try:
-        import snscrape  # noqa: F401
-        from snscrape.modules import twitter as sntwitter  # noqa: F401
-        return True
-    except Exception:
-        return False
-
-def fetch_tweets_via_snscrape(query: str, max_results: int = 200) -> List[Dict[str, Any]]:
-    items: List[Dict[str, Any]] = []
-    try:
-        from snscrape.modules import twitter as sntwitter
-    except Exception:
-        soft_fail("snscrape is not installed.", "Install with: pip install snscrape")
-        return items
+    prompt = f"""
+You are a helpful assistant that can access real-time X (Twitter) posts.
+Fetch up to {max_results} recent posts matching this query: {query} lang:{lang}
+Look back no more than {hours} hours.
+Return ONLY a JSON array of objects with these fields for each post:
+- id: string
+- created_at: ISO format (YYYY-MM-DDTHH:MM:SSZ)
+- text: full text
+- lang: language code
+- retweets: integer
+- likes: integer
+- username: screen name
+- url: full URL like "https://x.com/username/status/id"
+No explanations or other text.
+"""
 
     try:
-        scraper = sntwitter.TwitterSearchScraper(query)
-        for i, tw in enumerate(scraper.get_items()):
-            if i >= max_results:
-                break
-            try:
-                items.append({
-                    "id": getattr(tw, "id", None),
-                    "created_at": getattr(tw, "date", None),
-                    "text": getattr(tw, "content", "") or "",
-                    "lang": getattr(tw, "lang", None),
-                    "retweets": getattr(tw, "retweetCount", 0) or 0,
-                    "likes": getattr(tw, "likeCount", 0) or 0,
-                    "username": getattr(getattr(tw, "user", None), "username", "") or "",
-                    "url": getattr(tw, "url", "") or "",
-                })
-            except Exception:
-                continue
+        response = client.chat.completions.create(
+            model="grok-beta",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=4096,
+        )
+        raw_content = response.choices[0].message.content.strip()
+        tweets = json.loads(raw_content)
+        return tweets
     except Exception as e:
-        soft_fail("snscrape search failed.", f"snscrape EXC {e}")
-    return items
+        soft_fail("Grok tweet fetch failed.", f"EXC: {e}")
+        return []
 
-@st.cache_data(ttl=120, show_spinner=False)
-def _twitter_api_cached(bearer: str, query: str, start_iso: str, end_iso: str, max_results: int):
-    start_dt = dt.datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
-    end_dt = dt.datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
-    return fetch_tweets_via_api(bearer, query, start_dt, end_dt, max_results)
+def analyze_tweet_sentiment_grok(tweets: List[Dict[str, Any]]) -> pd.DataFrame:
+    api_key = get_xai_api_key()
+    if not api_key:
+        return pd.DataFrame()
 
-def fetch_tweets_via_api(
-    bearer: str,
-    query: str,
-    start_time: dt.datetime,
-    end_time: dt.datetime,
-    max_results: int = 100
-) -> List[Dict[str, Any]]:
-    """
-    Twitter/X v2 recent search with pagination, user expansion,
-    one retry on 429 (using x-rate-limit-reset), and verbose diagnostics.
-    """
-    items: List[Dict[str, Any]] = []
-    if not bearer:
-        soft_fail("Twitter API token missing.", "Set TWITTER_BEARER_TOKEN in .env or secrets.toml")
-        return items
+    client = OpenAI(api_key=api_key, base_url="https://api.x.ai/v1")
 
-    start_time, end_time = _clamp_to_recent_window(start_time, end_time)
+    texts = [t['text'] for t in tweets]
+    batch_size = 50  # to avoid token limits
+    compounds = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
+        prompt = """
+You are a sentiment analyst. For each text, return a compound score from -1 (negative) to +1 (positive).
+Return ONLY a JSON array of floats, no explanations.
+Texts:
+""" + "\n---\n".join(batch)
+        try:
+            response = client.chat.completions.create(
+                model="grok-beta",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+                max_tokens=1000,
+            )
+            raw = response.choices[0].message.content.strip()
+            scores = json.loads(raw)
+            compounds.extend(scores)
+        except Exception as e:
+            soft_fail("Grok sentiment analysis failed.", f"EXC: {e}")
+            compounds.extend([0.0] * len(batch))
 
-    url = "https://api.twitter.com/2/tweets/search/recent"
-    headers = {"Authorization": f"Bearer {bearer}", "User-Agent": "OneAfricaPulse/1.0"}
-    page_size = min(100, max(10, max_results))
-    next_token = None
-    fetched = 0
-    user_map: Dict[str, Dict[str, Any]] = {}
+    rows = []
+    for t, sc in zip(tweets, compounds):
+        label = "Neutral"
+        if sc >= 0.05:
+            label = "Positive"
+        elif sc <= -0.05:
+            label = "Negative"
+        rows.append({
+            "created_at": t.get("created_at"),
+            "text": t.get("text", ""),
+            "compound": sc,
+            "label": label,
+            "retweets": t.get("retweets", 0),
+            "likes": t.get("likes", 0),
+            "username": t.get("username", ""),
+            "url": t.get("url", ""),
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        try:
+            df["created_at"] = pd.to_datetime(df["created_at"])
+            df = df.sort_values("created_at", ascending=False).reset_index(drop=True)
+        except Exception:
+            pass
+    return df
 
-    def _one_page(next_tok: Optional[str]):
-        params = {
-            "query": query,
-            "max_results": page_size,
-            "start_time": _to_iso8601_z(start_time),
-            "end_time": _to_iso8601_z(end_time),
-            "tweet.fields": "created_at,lang,public_metrics,author_id",
-            "expansions": "author_id",
-            "user.fields": "username,name,public_metrics,verified"
-        }
-        if next_tok:
-            params["next_token"] = next_tok
-        return requests.get(url, headers=headers, params=params, timeout=20)
+# For Ollama option (alternative - requires Ollama running locally)
+# First, pip install langchain-community
+# from langchain_community.llms import Ollama
 
-    tried_retry_on_429 = False
+# def fetch_tweets_via_ollama(query: str, lang: str, hours: int, max_results: int = 300) -> List[Dict[str, Any]]:
+#     llm = Ollama(model="llama3")  # or your preferred model
+#     prompt = f"Fetch up to {max_results} recent X posts matching '{query} lang:{lang}' from last {hours} hours. Return JSON array with id, created_at, text, lang, retweets, likes, username, url."
+#     try:
+#         response = llm(prompt)
+#         tweets = json.loads(response)
+#         return tweets
+#     except Exception as e:
+#         soft_fail("Ollama tweet fetch failed.", f"EXC: {e}")
+#         return []
 
-    while fetched < max_results:
-        r = _one_page(next_token)
+# def analyze_tweet_sentiment_ollama(tweets: List[Dict[str, Any]]) -> pd.DataFrame:
+#     llm = Ollama(model="llama3")
+#     texts = [t['text'] for t in tweets]
+#     prompt = "Analyze sentiment for each text: return JSON array of floats from -1 to +1."
+#     try:
+#         response = llm(prompt + "\nTexts:\n" + "\n---\n".join(texts))
+#         scores = json.loads(response)
+#     except:
+#         scores = [0.0] * len(texts)
+#     # Then same as above to build df
+#     # ...
 
-        if r.status_code == 429:
-            limit, remaining, reset_unix = _parse_rate_limit_headers(r)
-            soft_fail("Twitter API rate-limited (429).",
-                      f"limit={limit} remaining={remaining} reset_unix={reset_unix}")
-            if not tried_retry_on_429:
-                tried_retry_on_429 = True
-                slept = _sleep_until_reset(reset_unix, cap_seconds=30)
-                if slept > 0:
-                    r = _one_page(next_token)
-                    if r.status_code == 429:
-                        break
-                else:
-                    break
-            else:
-                break
-
-        if r.status_code != 200:
-            txt = r.text[:300].replace("\n", " ")
-            soft_fail("Twitter API call failed.", f"twitter api {r.status_code} {txt}")
-            break
-
-        data = r.json()
-        for u in (data.get("includes", {}) or {}).get("users", []) or []:
-            user_map[u.get("id")] = u
-
-        batch = data.get("data", []) or []
-        if not batch and not data.get("meta", {}).get("next_token"):
-            soft_fail("Twitter returned zero results.",
-                      f"Query='{query}' window={start_time.isoformat()}→{end_time.isoformat()}")
-            break
-
-        for t in batch:
-            au = user_map.get(t.get("author_id") or "", {})
-            items.append({
-                "id": t.get("id"),
-                "created_at": t.get("created_at"),
-                "text": t.get("text", ""),
-                "lang": t.get("lang"),
-                "retweets": t.get("public_metrics", {}).get("retweet_count", 0),
-                "likes": t.get("public_metrics", {}).get("like_count", 0),
-                "username": au.get("username", ""),
-                "url": f"https://twitter.com/{au.get('username','i')}/status/{t.get('id')}"
-            })
-            fetched += 1
-            if fetched >= max_results:
-                break
-
-        next_token = data.get("meta", {}).get("next_token")
-        if not next_token:
-            break
-
-    return items[:max_results]
-
+# ========================= Social Sentiment (Twitter/X) =========================
 def get_sentiment_analyzer():
     if not HAS_VADER:
         return None
@@ -1077,6 +1006,8 @@ with st.sidebar:
         st.write(f"OPENAI_BASE_URL: **{os.environ.get('OPENAI_BASE_URL','(not set)')}**")
         tw_present = "Yes" if get_twitter_bearer() else "No"
         st.write(f"TWITTER_BEARER_TOKEN present: **{tw_present}**")
+        xai_present = "Yes" if get_xai_api_key() else "No"
+        st.write(f"XAI_API_KEY present: **{xai_present}**")
         if st.button("Run AI self-test"):
             if not have_openai():
                 st.error("No OPENAI_API_KEY or package not installed.")
@@ -1097,31 +1028,24 @@ with st.sidebar:
                         st.error(f"Model call failed: {e}")
 
         st.markdown("---")
-        st.write("**Twitter connectivity quick test**")
-        if st.button("Run Twitter Test"):
-            bearer = get_twitter_bearer()
-            if not bearer:
-                st.error("No TWITTER_BEARER_TOKEN found. Put it in `.env` or `secrets.toml`.")
+        st.write("**Grok connectivity quick test**")
+        if st.button("Test Grok"):
+            api_key = get_xai_api_key()
+            if not api_key:
+                st.error("No XAI_API_KEY found. Set it in .env or secrets.toml.")
             else:
+                client = OpenAI(api_key=api_key, base_url="https://api.x.ai/v1")
                 try:
-                    url = "https://api.twitter.com/2/tweets/search/recent"
-                    params = {"query": "news -is:retweet", "max_results": 10}
-                    r = requests.get(url, headers={"Authorization": f"Bearer {bearer}"}, params=params, timeout=15)
-                    st.write(f"HTTP {r.status_code}")
-                    limit, remaining, reset_unix = _parse_rate_limit_headers(r)
-                    st.write(f"Rate limit: limit={limit}, remaining={remaining}, reset_unix={reset_unix}")
-                    if reset_unix and reset_unix > 0:
-                        eta = max(0, reset_unix - int(time.time()))
-                        st.write(f"Resets in ~{eta} seconds")
-                    st.code(r.text[:500])
-                    if r.status_code == 401:
-                        st.warning("401 Unauthorized: token invalid/expired or project lacks access.")
-                    elif r.status_code == 403:
-                        st.warning("403 Forbidden: your project tier may not have recent search access.")
-                    elif r.status_code == 429:
-                        st.warning("429 Rate limit: reduce frequency/max_results, or wait for reset.")
+                    resp = client.chat.completions.create(
+                        model="grok-beta",
+                        messages=[{"role": "user", "content": "Say hello!"}],
+                        temperature=0.0,
+                        max_tokens=10
+                    )
+                    msg = (resp.choices[0].message.content or "").strip()
+                    st.success(f"Grok replied: {msg}")
                 except Exception as e:
-                    st.error(f"Request failed: {e}")
+                    st.error(f"Grok call failed: {e}")
 
 # ========================= LLM-only Article Analysis =========================
 @st.cache_data(ttl=30*60, show_spinner=False)
@@ -1182,7 +1106,7 @@ def analyze_with_llm(title: str, body: str, tags: List[str]) -> str:
             continue
     return ""
 
-# ========================= SINGLE COLLAPSIBLE CONFIG PANEL =========================
+# ========================= SINGLE COLLAPSIBLE CONFIG PANEL ====================
 with st.sidebar:
     with st.expander("⚙️ Configurations", expanded=False):
         st.header("Settings")
@@ -1262,7 +1186,8 @@ with st.sidebar:
         # 🐦 Social Sentiment (Twitter/X)
         st.subheader("🐦 Social Sentiment (Twitter/X)")
         enable_social = st.checkbox("Enable Twitter/X sentiment", value=True, key="enable_social")
-        method = st.radio("Method", ["Auto", "Twitter API (v2)", "snscrape"], horizontal=True, key="tw_method")
+        # NEW: Option for Grok or Ollama (comment out Ollama if not installed)
+        sentiment_method = st.radio("Sentiment Method", ["Grok (xAI API)", "Ollama (Local)"], key="sentiment_method")
         default_query = " OR ".join([kw for kw in keywords if " " not in kw][:6]) or "cashew OR shea OR cocoa"
         tw_query = st.text_input("Twitter search query", value=default_query, help="Example: cashew OR shea OR cocoa", key="tw_query")
         col_t1, col_t2, col_t3 = st.columns(3)
@@ -1273,7 +1198,7 @@ with st.sidebar:
         with col_t3:
             tw_max = st.number_input("Max tweets", min_value=10, max_value=1000, value=300, step=50, key="tw_max")
 
-        st.caption("Tip: To use the API method, set TWITTER_BEARER_TOKEN in your .env/Secrets. For snscrape, install with `pip install snscrape`.")
+        st.caption("Tip: For Grok, set XAI_API_KEY. For Ollama, install locally and run 'ollama serve' with a model like llama3.")
 
         st.markdown("---")
 
@@ -1305,7 +1230,7 @@ current_params = {
     "dedupe": bool(dedupe_across_sources),
     # Social
     "enable_social": bool(enable_social),
-    "tw_method": method,
+    "sentiment_method": sentiment_method,
     "tw_query": tw_query,
     "tw_hours": int(tw_hours),
     "tw_lang": tw_lang.strip(),
@@ -1640,49 +1565,21 @@ if run_btn:
 
             # ---------- Social Sentiment pass (optional) ----------
             if current_params["enable_social"]:
-                with st.spinner("Collecting and analyzing Twitter/X sentiment..."):
-                    since_dt = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=current_params["tw_hours"])
-                    until_dt = dt.datetime.now(dt.timezone.utc)
-                    # Clamp to ≤7 days for API
-                    api_start, api_end = _clamp_to_recent_window(since_dt, until_dt)
+                with st.spinner("Collecting and analyzing Twitter/X sentiment via Grok..."):
+                    q = current_params["tw_query"]
+                    lang = current_params["tw_lang"]
+                    hours = current_params["tw_hours"]
+                    max_t = current_params["tw_max"]
 
-                    q_api = _build_query_for_api(current_params["tw_query"], current_params["tw_lang"])
-                    q_sns = _build_query_for_snscrape(current_params["tw_query"], current_params["tw_lang"], since_dt, until_dt)
+                    tweets = fetch_tweets_via_grok(q, lang, hours, max_t)
+                    if current_params["sentiment_method"] == "Grok (xAI API)":
+                        df_t = analyze_tweet_sentiment_grok(tweets)
+                    else:
+                        # For Ollama, uncomment and install langchain-community
+                        # tweets = fetch_tweets_via_ollama(q, lang, hours, max_t)
+                        # df_t = analyze_tweet_sentiment_ollama(tweets)
+                        df_t = analyze_tweet_sentiment(tweets)  # fallback to VADER
 
-                    tweets: List[Dict[str, Any]] = []
-                    tried_api = False
-
-                    # Decide primary path
-                    prefer_api = (current_params["tw_method"] == "Twitter API (v2)") or (
-                        current_params["tw_method"] == "Auto" and get_twitter_bearer()
-                    )
-                    prefer_sns = (current_params["tw_method"] == "snscrape") or (
-                        current_params["tw_method"] == "Auto" and not get_twitter_bearer() and _snscrape_available()
-                    )
-
-                    if prefer_api and get_twitter_bearer():
-                        tried_api = True
-                        start_iso = _to_iso8601_z(api_start)
-                        end_iso = _to_iso8601_z(api_end)
-                        tweets = _twitter_api_cached(
-                            bearer=get_twitter_bearer(),
-                            query=q_api,
-                            start_iso=start_iso,
-                            end_iso=end_iso,
-                            max_results=current_params["tw_max"]
-                        )
-
-                    # Fallback if API produced nothing (or user selected snscrape)
-                    if (not tweets) and (prefer_sns or not tried_api):
-                        if _snscrape_available():
-                            tweets = fetch_tweets_via_snscrape(
-                                query=q_sns,
-                                max_results=current_params["tw_max"]
-                            )
-                        else:
-                            soft_fail("snscrape not installed.", "pip install snscrape")
-
-                    df_t = analyze_tweet_sentiment(tweets)
                     summ = summarize_sentiment(df_t)
                     st.session_state["sent_df"] = df_t
                     st.session_state["sent_summary"] = summ
