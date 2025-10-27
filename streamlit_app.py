@@ -76,6 +76,12 @@ except Exception as e:
     HAS_VADER = False
     logger.info(f"VADER not available: {e}")
 
+# ========================= NEW: Word export deps =========================
+from io import BytesIO
+from docx import Document
+from docx.shared import Pt, Inches
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+
 # ========================= App Strings / Theme =========================
 APP_NAME = "One Africa Market Pulse"
 TAGLINE = "Automated intelligence for cashew, shea, cocoa & allied markets."
@@ -384,7 +390,6 @@ def simple_extractive_summary(text: str, n_sentences: int = 3, keywords: Optiona
         try:
             vec = TfidfVectorizer(stop_words="english", max_features=8000)
             X = vec.fit_transform(sents)  # sparse
-            # centroid as 1D numpy array (avoid np.matrix warnings)
             centroid = np.asarray(X.mean(axis=0)).ravel()
             sims = cosine_similarity(X, centroid.reshape(1, -1)).ravel()
             if keywords:
@@ -461,7 +466,6 @@ def parse_feed_xml(content: bytes, base_url: str) -> List[Dict[str, str]]:
     items: List[Dict[str, str]] = []
     if not content:
         return items
-    # Quick sanity: ensure XML-ish
     try:
         sample = content.lstrip()[:16]
         if not sample.startswith(b"<") and not sample.startswith(b"\xef\xbb\xbf<"):
@@ -743,33 +747,6 @@ Texts:
             pass
     return df
 
-# For Ollama option (alternative - requires Ollama running locally)
-# First, pip install langchain-community
-# from langchain_community.llms import Ollama
-
-# def fetch_tweets_via_ollama(query: str, lang: str, hours: int, max_results: int = 300) -> List[Dict[str, Any]]:
-#     llm = Ollama(model="llama3")  # or your preferred model
-#     prompt = f"Fetch up to {max_results} recent X posts matching '{query} lang:{lang}' from last {hours} hours. Return JSON array with id, created_at, text, lang, retweets, likes, username, url."
-#     try:
-#         response = llm(prompt)
-#         tweets = json.loads(response)
-#         return tweets
-#     except Exception as e:
-#         soft_fail("Ollama tweet fetch failed.", f"EXC: {e}")
-#         return []
-
-# def analyze_tweet_sentiment_ollama(tweets: List[Dict[str, Any]]) -> pd.DataFrame:
-#     llm = Ollama(model="llama3")
-#     texts = [t['text'] for t in tweets]
-#     prompt = "Analyze sentiment for each text: return JSON array of floats from -1 to +1."
-#     try:
-#         response = llm(prompt + "\nTexts:\n" + "\n---\n".join(texts))
-#         scores = json.loads(response)
-#     except:
-#         scores = [0.0] * len(texts)
-#     # Then same as above to build df
-#     # ...
-
 # ========================= Social Sentiment (Twitter/X) =========================
 def get_sentiment_analyzer():
     if not HAS_VADER:
@@ -826,6 +803,156 @@ def summarize_sentiment(df: pd.DataFrame) -> Dict[str, Any]:
     share_neu = float((df["label"] == "Neutral").mean())
     share_neg = float((df["label"] == "Negative").mean())
     return {"n": n, "mean_compound": mean_c, "share_pos": share_pos, "share_neu": share_neu, "share_neg": share_neg}
+
+# ========================= NEW: Word (.docx) Builder =========================
+def _set_heading_style(p, size=16, bold=True):
+    run = p.runs[0] if p.runs else p.add_run()
+    run.font.size = Pt(size)
+    run.font.bold = bold
+
+def _add_kv_para(doc: Document, key: str, val: str):
+    p = doc.add_paragraph()
+    p.add_run(f"{key}: ").bold = True
+    p.add_run(val or "-")
+
+def build_results_docx(
+    app_name: str,
+    tagline: str,
+    quote: str,
+    results_df: pd.DataFrame,
+    digest_md: str,
+    params: Dict[str, Any],
+    sent_summary: Dict[str, Any] | None = None
+) -> bytes:
+    """
+    Returns a bytes object for a .docx containing:
+    - cover info (title, tagline, quote, timestamp, filters)
+    - results table (Source, Published, Title, Relevance, Impact)
+    - per-article summaries
+    - optional Social Sentiment metrics
+    - Daily Digest (Markdown flattened)
+    """
+    doc = Document()
+
+    # --- Cover / Title ---
+    title = doc.add_paragraph(app_name)
+    _set_heading_style(title, size=22, bold=True)
+    sub = doc.add_paragraph(tagline)
+    _set_heading_style(sub, size=12, bold=False)
+    doc.add_paragraph(quote)
+
+    # Timestamp + window
+    ts = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    _add_kv_para(doc, "Generated", ts)
+    try:
+        _add_kv_para(
+            doc, "Date Window",
+            f"{params.get('start_date').strftime('%Y-%m-%d')} → {params.get('end_date').strftime('%Y-%m-%d')}"
+        )
+    except Exception:
+        pass
+    _add_kv_para(doc, "Min Relevance", f"{params.get('min_relevance',0):.2f}")
+    _add_kv_para(doc, "Keywords", ", ".join(params.get('keywords', [])) or "-")
+
+    doc.add_paragraph().add_run(" ").add_break()  # spacer
+
+    # --- Results summary table (compact) ---
+    doc.add_paragraph("Results Overview").runs[0].bold = True
+    if results_df is None or results_df.empty:
+        doc.add_paragraph("No relevant items found for the selected period.")
+    else:
+        show_cols = ["source", "published", "title", "relevance", "impact"]
+        tmp = results_df[show_cols].copy()
+        tmp["impact"] = tmp["impact"].apply(lambda x: ", ".join(x) if isinstance(x, list) else str(x))
+        tmp["relevance"] = tmp["relevance"].apply(lambda r: f"{r:.0%}")
+
+        table = doc.add_table(rows=1, cols=len(show_cols))
+        hdr_cells = table.rows[0].cells
+        for i, c in enumerate(["Source", "Published", "Title", "Relevance", "Impact"]):
+            hdr_cells[i].text = c
+
+        for _, row in tmp.head(50).iterrows():
+            cells = table.add_row().cells
+            cells[0].text = str(row["source"])
+            cells[1].text = str(row["published"])
+            cells[2].text = str(row["title"])
+            cells[3].text = str(row["relevance"])
+            cells[4].text = str(row["impact"])
+
+    doc.add_paragraph().add_run(" ").add_break()  # spacer
+
+    # --- Per-article blocks with summaries ---
+    if results_df is not None and not results_df.empty:
+        h = doc.add_paragraph("Articles & Auto-Summaries")
+        _set_heading_style(h, size=14, bold=True)
+
+        for i, row in results_df.iterrows():
+            doc.add_paragraph().add_run(" ").add_break()  # spacer between cards
+            p = doc.add_paragraph(f"{i+1}. {row['title']}")
+            _set_heading_style(p, size=12, bold=True)
+
+            meta = doc.add_paragraph()
+            meta.add_run("Source: ").bold = True
+            meta.add_run(str(row["source"]))
+            meta.add_run("   |   Published: ").bold = True
+            meta.add_run(str(row["published"]))
+            meta.add_run("   |   Relevance: ").bold = True
+            try:
+                meta.add_run(f"{row['relevance']:.0%}")
+            except Exception:
+                meta.add_run(str(row["relevance"]))
+
+            imp = ", ".join(row["impact"]) if isinstance(row["impact"], list) else str(row["impact"])
+            impp = doc.add_paragraph()
+            impp.add_run("Impact: ").bold = True
+            impp.add_run(imp)
+
+            sump = doc.add_paragraph()
+            sump.add_run("Summary: ").bold = True
+            sump.add_run(row.get("auto_summary") or "")
+
+            linkp = doc.add_paragraph()
+            linkp.add_run("Link: ").bold = True
+            linkp.add_run(row.get("link") or "")
+
+    # --- Social Sentiment (optional) ---
+    if sent_summary and isinstance(sent_summary, dict) and (sent_summary.get("n", 0) > 0):
+        doc.add_paragraph().add_run(" ").add_break()
+        h2 = doc.add_paragraph("Twitter/X Sentiment Snapshot")
+        _set_heading_style(h2, size=14, bold=True)
+        _add_kv_para(doc, "Tweets analyzed", str(int(sent_summary.get("n", 0))))
+        _add_kv_para(doc, "Mean (compound)", f"{sent_summary.get('mean_compound', 0.0):+.3f}")
+        _add_kv_para(doc, "Positive", f"{100*sent_summary.get('share_pos',0.0):.1f}%")
+        _add_kv_para(doc, "Neutral", f"{100*sent_summary.get('share_neu',0.0):.1f}%")
+        _add_kv_para(doc, "Negative", f"{100*sent_summary.get('share_neg',0.0):.1f}%")
+
+    # --- Daily Digest (Markdown text flattened) ---
+    if digest_md:
+        doc.add_paragraph().add_run(" ").add_break()
+        h3 = doc.add_paragraph("Daily Digest")
+        _set_heading_style(h3, size=14, bold=True)
+
+        lines = (digest_md or "").splitlines()
+        for line in lines:
+            line = line.rstrip()
+            if line.startswith("#"):
+                txt = line.lstrip("# ").strip()
+                p = doc.add_paragraph(txt)
+                _set_heading_style(p, size=12, bold=True)
+            elif line.startswith(("- ", "* ")):
+                p = doc.add_paragraph(line[2:])
+                p_format = p.paragraph_format
+                p_format.left_indent = Inches(0.25)
+            elif line.strip() == "---":
+                doc.add_paragraph().add_run("—" * 20)
+            else:
+                if line.strip():
+                    doc.add_paragraph(line)
+
+    buf = BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
 
 # ========================= UI Helpers =========================
 st.set_page_config(page_title=APP_NAME, page_icon="🌍", layout="wide", initial_sidebar_state="expanded")
@@ -1171,7 +1298,6 @@ with st.sidebar:
         custom_kw = st.text_area("Keywords (comma-separated)", ", ".join(DEFAULT_KEYWORDS), height=100, key="kw_text")
         keywords = [k.strip() for k in custom_kw.split(",") if k.strip()]
         min_relevance = st.number_input("Min relevance (0.00–1.00)", min_value=0.0, max_value=1.0, value=0.05, step=0.01, format="%.2f", key="min_rel")
-        # Default set to 10 as requested
         per_source_cap = st.number_input("Max articles per source", min_value=1, max_value=200, value=10, step=1, key="cap")
 
         st.markdown("---")
@@ -1186,7 +1312,6 @@ with st.sidebar:
         # 🐦 Social Sentiment (Twitter/X)
         st.subheader("🐦 Social Sentiment (Twitter/X)")
         enable_social = st.checkbox("Enable Twitter/X sentiment", value=True, key="enable_social")
-        # NEW: Option for Grok or Ollama (comment out Ollama if not installed)
         sentiment_method = st.radio("Sentiment Method", ["Grok (xAI API)", "Ollama (Local)"], key="sentiment_method")
         default_query = " OR ".join([kw for kw in keywords if " " not in kw][:6]) or "cashew OR shea OR cocoa"
         tw_query = st.text_input("Twitter search query", value=default_query, help="Example: cashew OR shea OR cocoa", key="tw_query")
@@ -1498,6 +1623,28 @@ def ui_results(df: pd.DataFrame, top_k: int, sent_df: Optional[pd.DataFrame], se
                            file_name=csv_name, mime="text/csv")
         st.download_button("📥 Download Digest (Markdown)", data=digest_md.encode("utf-8"),
                            file_name=md_name, mime="text/markdown")
+
+        # NEW: Word (.docx) export button
+        try:
+            docx_bytes = build_results_docx(
+                app_name=APP_NAME,
+                tagline=TAGLINE,
+                quote=QUOTE,
+                results_df=export_df,
+                digest_md=digest_md,
+                params=st.session_state.get("last_scan_params", current_params),
+                sent_summary=sent_summary
+            )
+            docx_name = f"oneafrica_pulse_{ts}.docx"
+            st.download_button(
+                "📥 Download Report (Word .docx)",
+                data=docx_bytes,
+                file_name=docx_name,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+        except Exception as e:
+            st.error(f"Could not generate Word report: {e}")
+
         st.info("💡 Tip: Paste the Markdown into an email, WhatsApp (as a code block), or your wiki for quick sharing.")
 
     # -------- Social Sentiment Section --------
@@ -1575,9 +1722,6 @@ if run_btn:
                     if current_params["sentiment_method"] == "Grok (xAI API)":
                         df_t = analyze_tweet_sentiment_grok(tweets)
                     else:
-                        # For Ollama, uncomment and install langchain-community
-                        # tweets = fetch_tweets_via_ollama(q, lang, hours, max_t)
-                        # df_t = analyze_tweet_sentiment_ollama(tweets)
                         df_t = analyze_tweet_sentiment(tweets)  # fallback to VADER
 
                     summ = summarize_sentiment(df_t)
