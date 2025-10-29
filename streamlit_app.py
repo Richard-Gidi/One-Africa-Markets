@@ -1244,8 +1244,23 @@ with st.sidebar:
         for name, url in DEFAULT_SOURCES.items():
             if st.checkbox(name, value=True, key=f"src_{name}"):
                 chosen_sources.append(url)
+        
+        st.subheader("➕ Custom RSS/Atom Sources")
+        custom_text = st.text_area("Enter URLs (one per line)", height=80, key="custom_sources") or ""
+        custom_urls = [u.strip() for u in custom_text.splitlines() if u.strip() and u.startswith(('http://', 'https://'))]
+        if custom_text and not custom_urls:
+            st.warning("No valid HTTP/HTTPS URLs found in custom sources.")
+        for idx, url in enumerate(custom_urls):
+            domain = urlparse(url).netloc or f"Custom {idx+1}"
+            if st.checkbox(domain, value=True, key=f"custom_src_{idx}"):
+                chosen_sources.append(url)
+        
         if st.button("🔄 Check Feeds", key="check_feeds"):
-            for name, url in DEFAULT_SOURCES.items():
+            to_check = {name: url for name, url in DEFAULT_SOURCES.items()}
+            for idx, url in enumerate(custom_urls):
+                domain = urlparse(url).netloc or f"Custom {idx+1}"
+                to_check[domain] = url
+            for name, url in to_check.items():
                 ok, status = validate_feed(url, ignore_recency_check=True)
                 st.write(f"{'✅' if ok else '❌'} {name}: {status}")
 
@@ -1666,9 +1681,9 @@ def ui_results(df: pd.DataFrame, top_k: int, sent_df: Optional[pd.DataFrame], se
         share_df = pd.DataFrame({
             "label": ["Positive","Neutral","Negative"],
             "share": [
-                100*sent_summary.get("share_pos",0.0),
-                100*sent_summary.get("share_neu",0.0),
-                100*sent_summary.get("share_neg",0.0),
+                100*sent_summary.get('share_pos',0.0),
+                100*sent_summary.get('share_neu',0.0),
+                100*sent_summary.get('share_neg',0.0),
             ]
         })
         st.bar_chart(data=share_df, x="label", y="share", use_container_width=True)
@@ -1746,13 +1761,13 @@ sent_summary = st.session_state.get("sent_summary", {})
 if df is None:
     st.info("""
 **What this demo does:**
-- Scans curated RSS/Atom feeds (+ optional Newsdata.io API) for the last *N* days  
-- Fetches full article text where possible + **thumbnails** (Open Graph)  
-- Scores relevance against **your commodity & policy keywords**  
-- Auto-summarizes into 2–6 sentences  
-- Tags each item (Supply Risk, FX & Policy, Logistics, etc.)  
-- Outputs a **downloadable CSV** and **Daily Digest (Markdown)**
-- (Not yet functional) Collects and analyzes **Twitter/X sentiment** for your query/time window
+- 📰 Scans curated RSS/Atom feeds (+ optional Newsdata.io API) for the last *N* days  
+- 📑 Fetches full article text where possible + **thumbnails** (Open Graph)  
+- 🎯 Scores relevance against **your commodity & policy keywords**  
+- 📝 Auto-summarizes into 2–6 sentences  
+- 🏷️ Tags each item (Supply Risk, FX & Policy, Logistics, etc.)  
+- 💾 Outputs a **downloadable CSV** and **Daily Digest (Markdown)**
+- 🐦 (Optional) Collects and analyzes **Twitter/X sentiment** for your query/time window
     """)
 else:
     ui_results(df, top_k=st.session_state.get("last_scan_params", {}).get("top_k", 12),
