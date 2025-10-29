@@ -1752,7 +1752,7 @@ if df is None:
 - 📝 Auto-summarizes into 2–6 sentences  
 - 🏷️ Tags each item (Supply Risk, FX & Policy, Logistics, etc.)  
 - 💾 Outputs a **downloadable CSV** and **Daily Digest (Markdown)**
-- 🐦 (Optional) Collects and analyzes **Twitter/X sentiment** for your query/time window
+- 🐦 (Not yet functional) Collects and analyzes **Twitter/X sentiment** for your query/time window
     """)
 else:
     ui_results(df, top_k=st.session_state.get("last_scan_params", {}).get("top_k", 12),
