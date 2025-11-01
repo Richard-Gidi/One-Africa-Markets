@@ -661,6 +661,7 @@ def fetch_from_newsdata(
     language: Optional[str] = None,
     country: Optional[str] = None,
     category: Optional[str] = None,
+    domain: Optional[str] = None, # <-- NEW
     max_pages: int = 2,
 ) -> List[Dict[str, Any]]:
     if not api_key:
@@ -669,6 +670,7 @@ def fetch_from_newsdata(
     if language: redacted["language"] = language
     if country: redacted["country"] = country
     if category: redacted["category"] = category
+    if domain: redacted["domain"] = domain # <-- NEW
 
     _ = fetch_from_newsdata_cached(redacted, max_pages=max_pages)
     items_raw = fetch_from_newsdata_runtime(api_key=api_key, base_params=redacted, max_pages=max_pages)
@@ -1387,6 +1389,11 @@ with st.sidebar:
         with c1: nd_language = st.text_input("Language (e.g., en, fr)", value="", key="nd_lang")
         with c2: nd_country = st.text_input("Country (e.g., gh, ng, ci)", value="", key="nd_cty")
         with c3: nd_category = st.text_input("Category (e.g., business)", value="", key="nd_cat")
+        
+        # --- NEW: Domain filter for Newsdata ---
+        nd_domains = st.text_input("Domains (e.g., reuters.com,bloomberg.com)", value="reuters.com,bloomberg.com", key="nd_domains")
+        # --- END NEW ---
+
         nd_pages = st.number_input("Newsdata pages", min_value=1, max_value=10, value=2, step=1, key="nd_pages")
 
         st.markdown("---")
@@ -1465,6 +1472,7 @@ current_params = {
     "nd_language": nd_language,
     "nd_country": nd_country,
     "nd_category": nd_category,
+    "nd_domains": nd_domains.strip(), # <-- NEW
     "nd_pages": int(nd_pages),
     "start_date": start_date,
     "end_date": end_date,
@@ -1631,6 +1639,7 @@ def fetch_all(params: Dict[str, Any]) -> List[Dict[str, Any]]:
                 language=params["nd_language"] or None,
                 country=params["nd_country"] or None,
                 category=params["nd_category"] or None,
+                domain=params["nd_domains"] or None, # <-- NEW
                 max_pages=int(params["nd_pages"]),
             )
             if params["per_source_cap"] and nd_items:
