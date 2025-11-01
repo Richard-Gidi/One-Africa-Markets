@@ -1667,6 +1667,7 @@ def render_card(row: pd.Series):
                             st.session_state["ai_analyses"][key] = md
                             st.markdown(md)
 
+# --- MODIFIED: Removed the Daily Digest and Downloads from here ---
 def ui_results(df: pd.DataFrame, top_k: int, sent_df: Optional[pd.DataFrame], sent_summary: Dict[str, Any]):
     st.subheader("📊 Results")
     if df.empty:
@@ -1704,43 +1705,46 @@ def ui_results(df: pd.DataFrame, top_k: int, sent_df: Optional[pd.DataFrame], se
                     with col:
                         render_card(pd.Series(cards[i + j]))
         st.markdown("<br>", unsafe_allow_html=True)
+        
+        # --- NEW: Moved Daily Digest and Downloads into a separate expander ---
+        with st.expander("📝 View Digest & Download Reports", expanded=False):
+            st.subheader("📝 Daily Digest")
+            digest_md = make_digest(filtered if (impact_filter or source_filter) else df, top_k=top_k)
+            st.markdown(digest_md)
 
-        st.subheader("📝 Daily Digest")
-        digest_md = make_digest(filtered if (impact_filter or source_filter) else df, top_k=top_k)
-        st.markdown(digest_md)
+            st.subheader("⬇️ Downloads")
+            ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
+            export_df = filtered if (impact_filter or source_filter) else df
+            csv_name = f"oneafrica_pulse_{ts}.csv"
+            md_name = f"oneafrica_pulse_digest_{ts}.md"
+            st.download_button("📥 Download CSV", data=export_df.to_csv(index=False).encode("utf-8"),
+                                file_name=csv_name, mime="text/csv")
+            st.download_button("📥 Download Digest (Markdown)", data=digest_md.encode("utf-8"),
+                                file_name=md_name, mime="text/markdown")
 
-        st.subheader("⬇️ Downloads")
-        ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
-        export_df = filtered if (impact_filter or source_filter) else df
-        csv_name = f"oneafrica_pulse_{ts}.csv"
-        md_name = f"oneafrica_pulse_digest_{ts}.md"
-        st.download_button("📥 Download CSV", data=export_df.to_csv(index=False).encode("utf-8"),
-                            file_name=csv_name, mime="text/csv")
-        st.download_button("📥 Download Digest (Markdown)", data=digest_md.encode("utf-8"),
-                            file_name=md_name, mime="text/markdown")
+            try:
+                docx_bytes = build_results_docx(
+                    app_name=APP_NAME,
+                    tagline=TAGLINE,
+                    quote=QUOTE,
+                    results_df=export_df,
+                    digest_md=digest_md,
+                    params=st.session_state.get("last_scan_params", current_params),
+                    sent_summary=sent_summary
+                )
+                docx_name = f"oneafrica_pulse_{ts}.docx"
+                st.download_button(
+                    "📥 Download Report (Word .docx)",
+                    data=docx_bytes,
+                    file_name=docx_name,
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                )
+            except Exception as e:
+                st.error(f"Could not generate Word report: {e}")
 
-        # NEW: Word (.docx) export button
-        try:
-            docx_bytes = build_results_docx(
-                app_name=APP_NAME,
-                tagline=TAGLINE,
-                quote=QUOTE,
-                results_df=export_df,
-                digest_md=digest_md,
-                params=st.session_state.get("last_scan_params", current_params),
-                sent_summary=sent_summary
-            )
-            docx_name = f"oneafrica_pulse_{ts}.docx"
-            st.download_button(
-                "📥 Download Report (Word .docx)",
-                data=docx_bytes,
-                file_name=docx_name,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            )
-        except Exception as e:
-            st.error(f"Could not generate Word report: {e}")
+            st.info("💡 Tip: Paste the Markdown into an email, WhatsApp (as a code block), or your wiki for quick sharing.")
+        # --- END NEW EXPANDER ---
 
-        st.info("💡 Tip: Paste the Markdown into an email, WhatsApp (as a code block), or your wiki for quick sharing.")
 
     # -------- Social Sentiment Section --------
     st.markdown("---")
@@ -1855,3 +1859,4 @@ if df is None:
 else:
     ui_results(df, top_k=st.session_state.get("last_scan_params", {}).get("top_k", 12),
                sent_df=sent_df, sent_summary=sent_summary)
+
