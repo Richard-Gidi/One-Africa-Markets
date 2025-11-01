@@ -1,7 +1,3 @@
-# OneAfrica Market Pulse — Automated Market Intelligence (Streamlit Demo)
-# Author: Richard Gidi
-# Run: streamlit run streamlit_app.py
-
 import os
 import re
 import html
@@ -401,6 +397,63 @@ def simple_extractive_summary(text: str, n_sentences: int = 3, keywords: Optiona
         except Exception as e:
             logger.info(f"summary fallback: {e}")
     return " ".join(sents[:n_sentences])
+
+# --- NEW: LLM Abstractive Summary ---
+def have_openai():
+    """Helper to check if OpenAI lib is loaded and key is present."""
+    return OPENAI_OK and bool(get_openai_api_key())
+
+def get_openai_client():
+    """Robust client factory that respects OPENAI_BASE_URL if set."""
+    try:
+        api_key = get_openai_api_key()
+        if not api_key:
+            return None
+        base_url = os.environ.get("OPENAI_BASE_URL", "").strip()
+        if base_url:
+            return OpenAI(api_key=api_key, base_url=base_url)
+        return OpenAI(api_key=api_key)  # official endpoint
+    except Exception as e:
+        logger.warning(f"OpenAI client init failed: {e}")
+        return None
+
+@st.cache_data(ttl=60*60, show_spinner=False) # Cache for 1 hour
+def llm_abstractive_summary(text: str, keywords: List[str]) -> str:
+    """
+    Generates a concise, abstractive summary using an LLM, focused on
+    the provided keywords.
+    """
+    if not text or not have_openai():
+        return ""
+    client = get_openai_client()
+    if client is None:
+        return ""
+
+    kw_str = ", ".join(keywords)
+    prompt = f"""
+    You are a market analyst. Summarize the following article text in 2-3 concise sentences.
+    Focus *only* on facts relevant to these keywords: {kw_str}
+    If the text has no relevance to the keywords, return an empty string.
+
+    Article (may be partial):
+    {text[:7000]}
+    """
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini", # Use a fast, modern model
+            temperature=0.1,
+            messages=[
+                {"role": "system", "content": "Be concise, factual, and strictly relevant to the provided keywords."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        summary = (resp.choices[0].message.content or "").strip()
+        return summary
+    except Exception as e:
+        logger.warning(f"llm_abstractive_summary failed: {e}")
+        soft_fail("One LLM summary failed, used fallback.", f"llm_summary EXC {e}")
+        return ""
+# --- END NEW FUNCTION ---
 
 def classify_impact(text: str) -> List[str]:
     tags = []
@@ -894,9 +947,9 @@ def build_results_docx(
             meta = doc.add_paragraph()
             meta.add_run("Source: ").bold = True
             meta.add_run(str(row["source"]))
-            meta.add_run("   |   Published: ").bold = True
+            meta.add_run("    |    Published: ").bold = True
             meta.add_run(str(row["published"]))
-            meta.add_run("   |   Relevance: ").bold = True
+            meta.add_run("    |    Relevance: ").bold = True
             try:
                 meta.add_run(f"{row['relevance']:.0%}")
             except Exception:
@@ -1026,22 +1079,7 @@ def init_chat_state():
 if "chat_history" not in st.session_state:
     init_chat_state()
 
-def have_openai():
-    return OPENAI_OK and bool(get_openai_api_key())
-
-# ---- Robust client (respects OPENAI_BASE_URL if set) ----
-def get_openai_client():
-    try:
-        api_key = get_openai_api_key()
-        if not api_key:
-            return None
-        base_url = os.environ.get("OPENAI_BASE_URL", "").strip()
-        if base_url:
-            return OpenAI(api_key=api_key, base_url=base_url)
-        return OpenAI(api_key=api_key)  # official endpoint
-    except Exception as e:
-        logger.warning(f"OpenAI client init failed: {e}")
-        return None
+# NOTE: have_openai() and get_openai_client() are defined in the new section above
 
 def generate_assistant_reply(messages, temperature: float = 0.4):
     if not have_openai():
@@ -1320,6 +1358,13 @@ with st.sidebar:
         # 📝 Content Settings
         st.subheader("📝 Content Settings")
         n_sent = st.number_input("Sentences per summary", min_value=2, max_value=10, value=3, step=1, key="n_sent")
+        
+        # --- NEW: Summary Method ---
+        summary_method = st.radio("Summary Method", ["Extractive (Fast, Local)", "Abstractive (LLM)"], key="summary_method")
+        if summary_method == "Abstractive (LLM)" and not have_openai():
+            st.warning("No OPENAI_API_KEY found. LLM summaries will fall back to extractive method.")
+        # --- END NEW ---
+        
         top_k = st.number_input("Digest: top items", min_value=5, max_value=100, value=12, step=1, key="top_k")
 
         st.markdown("---")
@@ -1327,7 +1372,7 @@ with st.sidebar:
         # 🐦 Social Sentiment (Twitter/X)
         st.subheader("🐦 Social Sentiment (Twitter/X)")
         enable_social = st.checkbox("Enable Twitter/X sentiment", value=True, key="enable_social")
-        sentiment_method = st.radio("Sentiment Method", ["Grok (xAI API)", "Ollama (Local)"], key="sentiment_method")
+        sentiment_method = st.radio("Sentiment Method", ["Grok (xAI API)", "VADER (Local)"], key="sentiment_method")
         default_query = " OR ".join([kw for kw in keywords if " " not in kw][:6]) or "cashew OR shea OR cocoa"
         tw_query = st.text_input("Twitter search query", value=default_query, help="Example: cashew OR shea OR cocoa", key="tw_query")
         col_t1, col_t2, col_t3 = st.columns(3)
@@ -1338,7 +1383,7 @@ with st.sidebar:
         with col_t3:
             tw_max = st.number_input("Max tweets", min_value=10, max_value=1000, value=300, step=50, key="tw_max")
 
-        st.caption("Tip: For Grok, set XAI_API_KEY. For Ollama, install locally and run 'ollama serve' with a model like llama3.")
+        st.caption("Tip: For Grok, set XAI_API_KEY. For VADER, NLTK is used locally (no key needed).")
 
         st.markdown("---")
 
@@ -1364,6 +1409,7 @@ current_params = {
     "min_relevance": float(min_relevance),
     "per_source_cap": int(per_source_cap),
     "n_sent": int(n_sent),
+    "summary_method": summary_method, # <-- NEW
     "top_k": int(top_k),
     "force_fetch": bool(force_fetch),
     "ignore_recency": bool(ignore_recency),
@@ -1429,7 +1475,11 @@ def process_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
         return pd.DataFrame(columns=["source","published","title","relevance","impact","auto_summary","link","image"])
     return df.sort_values("relevance", ascending=False).reset_index(drop=True)
 
-def enrich(entry: Dict[str, Any], keywords: List[str], min_relevance: float, n_sent: int) -> Optional[Dict[str, Any]]:
+def enrich(entry: Dict[str, Any], keywords: List[str], min_relevance: float, n_sent: int, summary_method: str) -> Optional[Dict[str, Any]]:
+    """
+    --- MODIFIED ---
+    Added `summary_method` to signature.
+    """
     try:
         article_text, image_url = fetch_article_text_and_image(entry.get("link",""))
         base = entry.get("summary") or ""
@@ -1438,7 +1488,21 @@ def enrich(entry: Dict[str, Any], keywords: List[str], min_relevance: float, n_s
         rel = keyword_relevance(" ".join([entry.get("title",""), body]), keywords)
         if rel < min_relevance:
             return None
-        summary = simple_extractive_summary(body, n_sentences=n_sent, keywords=keywords)
+        
+        # --- MODIFIED: Conditional Summary ---
+        summary = ""
+        if summary_method == "Abstractive (LLM)":
+            if not have_openai():
+                soft_fail("LLM Summary skipped (no API key).", "LLM Summary skipped")
+                summary = simple_extractive_summary(body, n_sentences=n_sent, keywords=keywords)
+            else:
+                summary = llm_abstractive_summary(body, keywords)
+                if not summary: # Fallback if LLM fails or returns empty
+                    summary = simple_extractive_summary(body, n_sentences=n_sent, keywords=keywords)
+        else: # Default to extractive
+            summary = simple_extractive_summary(body, n_sentences=n_sent, keywords=keywords)
+        # --- END MODIFIED ---
+
         impacts = classify_impact(" ".join([entry.get("title",""), body])) or ["General"]
 
         return {
@@ -1475,7 +1539,15 @@ def fetch_all(params: Dict[str, Any]) -> List[Dict[str, Any]]:
 
         if raw_items:
             with ThreadPoolExecutor(max_workers=6) as ex:
-                futures = [ex.submit(enrich, {**e, "source": urlparse(src).netloc}, params["keywords"], params["min_relevance"], params["n_sent"]) for e in raw_items]
+                # --- MODIFIED: Pass summary_method to enrich ---
+                futures = [ex.submit(enrich,
+                                    {**e, "source": urlparse(src).netloc},
+                                    params["keywords"],
+                                    params["min_relevance"],
+                                    params["n_sent"],
+                                    params["summary_method"] # <-- NEW
+                                   ) for e in raw_items]
+                # --- END MODIFIED ---
                 for fut in as_completed(futures):
                     try:
                         r = fut.result()
@@ -1502,7 +1574,15 @@ def fetch_all(params: Dict[str, Any]) -> List[Dict[str, Any]]:
                 nd_items = nd_items[:params["per_source_cap"]]
             if nd_items:
                 with ThreadPoolExecutor(max_workers=6) as ex:
-                    futures = [ex.submit(enrich, it, params["keywords"], params["min_relevance"], params["n_sent"]) for it in nd_items]
+                    # --- MODIFIED: Pass summary_method to enrich ---
+                    futures = [ex.submit(enrich,
+                                        it,
+                                        params["keywords"],
+                                        params["min_relevance"],
+                                        params["n_sent"],
+                                        params["summary_method"] # <-- NEW
+                                       ) for it in nd_items]
+                    # --- END MODIFIED ---
                     for fut in as_completed(futures):
                         try:
                             r = fut.result()
@@ -1623,7 +1703,7 @@ def ui_results(df: pd.DataFrame, top_k: int, sent_df: Optional[pd.DataFrame], se
                 if i + j < len(cards):
                     with col:
                         render_card(pd.Series(cards[i + j]))
-            st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
 
         st.subheader("📝 Daily Digest")
         digest_md = make_digest(filtered if (impact_filter or source_filter) else df, top_k=top_k)
@@ -1635,9 +1715,9 @@ def ui_results(df: pd.DataFrame, top_k: int, sent_df: Optional[pd.DataFrame], se
         csv_name = f"oneafrica_pulse_{ts}.csv"
         md_name = f"oneafrica_pulse_digest_{ts}.md"
         st.download_button("📥 Download CSV", data=export_df.to_csv(index=False).encode("utf-8"),
-                           file_name=csv_name, mime="text/csv")
+                            file_name=csv_name, mime="text/csv")
         st.download_button("📥 Download Digest (Markdown)", data=digest_md.encode("utf-8"),
-                           file_name=md_name, mime="text/markdown")
+                            file_name=md_name, mime="text/markdown")
 
         # NEW: Word (.docx) export button
         try:
@@ -1727,7 +1807,11 @@ if run_btn:
 
             # ---------- Social Sentiment pass (optional) ----------
             if current_params["enable_social"]:
-                with st.spinner("Collecting and analyzing Twitter/X sentiment via Grok..."):
+                spinner_msg = "Collecting and analyzing Twitter/X sentiment..."
+                if current_params["sentiment_method"] == "Grok (xAI API)":
+                    spinner_msg = "Collecting and analyzing Twitter/X sentiment via Grok..."
+
+                with st.spinner(spinner_msg):
                     q = current_params["tw_query"]
                     lang = current_params["tw_lang"]
                     hours = current_params["tw_hours"]
@@ -1736,8 +1820,8 @@ if run_btn:
                     tweets = fetch_tweets_via_grok(q, lang, hours, max_t)
                     if current_params["sentiment_method"] == "Grok (xAI API)":
                         df_t = analyze_tweet_sentiment_grok(tweets)
-                    else:
-                        df_t = analyze_tweet_sentiment(tweets)  # fallback to VADER
+                    else: # VADER (Local)
+                        df_t = analyze_tweet_sentiment(tweets)
 
                     summ = summarize_sentiment(df_t)
                     st.session_state["sent_df"] = df_t
@@ -1763,10 +1847,9 @@ if df is None:
 **What this demo does:**
 - 📰 Scans curated RSS/Atom feeds (+ optional Newsdata.io API) for the last *N* days  
 - 📑 Fetches full article text where possible + **thumbnails** (Open Graph)  
-- 🎯 Scores relevance against **your commodity & policy keywords**  
-- 📝 Auto-summarizes into 2–6 sentences  
+- 🎯 Scores relevance against **your commodity & policy keywords** - 📝 Auto-summarizes (local-extractive or **LLM-abstractive**)  
 - 🏷️ Tags each item (Supply Risk, FX & Policy, Logistics, etc.)  
-- 💾 Outputs a **downloadable CSV** and **Daily Digest (Markdown)**
+- 💾 Outputs a **downloadable CSV**, **Word Report (.docx)** and **Daily Digest (Markdown)**
 - 🐦 (Optional) Collects and analyzes **Twitter/X sentiment** for your query/time window
     """)
 else:
