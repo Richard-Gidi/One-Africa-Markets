@@ -801,6 +801,68 @@ Texts:
     return df
 
 # ========================= Social Sentiment (Twitter/X) =========================
+# --- NEW: Twitter V2 API Fetcher ---
+@st.cache_data(ttl=60*10, show_spinner=False)
+def fetch_tweets_via_twitter_v2(bearer_token: str, query: str, lang: str, start_time_iso: str, max_results: int) -> List[Dict[str, Any]]:
+    """
+    Fetches tweets directly from the Twitter v2 API (recent search).
+    """
+    if not bearer_token:
+        soft_fail("TWITTER_BEARER_TOKEN missing.", "Set TWITTER_BEARER_TOKEN in .env or secrets.")
+        return []
+
+    session = get_session()
+    url = "https://api.twitter.com/2/tweets/search/recent"
+    
+    # Build query: add lang filter if provided
+    full_query = query
+    if lang:
+        full_query += f" lang:{lang}"
+    
+    params = {
+        "query": full_query,
+        "max_results": max(10, min(100, max_results)), # Twitter max_results is 10-100
+        "start_time": start_time_iso,
+        "tweet.fields": "created_at,lang,public_metrics",
+        "expansions": "author_id",
+        "user.fields": "username",
+    }
+    headers = {
+        "Authorization": f"Bearer {bearer_token}",
+        "User-Agent": "OneAfricaPulse/1.0",
+    }
+    
+    try:
+        r = session.get(url, params=params, headers=headers, timeout=20)
+        if r.status_code != 200:
+            soft_fail("Twitter v2 API fetch failed (non-200).", f"Twitter v2 API {r.status_code}: {r.text[:200]}")
+            return []
+        
+        data = r.json()
+        tweets = data.get("data", [])
+        includes = data.get("includes", {})
+        users = {u["id"]: u["username"] for u in includes.get("users", [])}
+        
+        results = []
+        for t in tweets:
+            author_id = t.get("author_id")
+            username = users.get(author_id, "unknown")
+            metrics = t.get("public_metrics", {})
+            results.append({
+                "id": t.get("id"),
+                "created_at": t.get("created_at"),
+                "text": t.get("text"),
+                "lang": t.get("lang"),
+                "retweets": metrics.get("retweet_count", 0),
+                "likes": metrics.get("like_count", 0),
+                "username": username,
+                "url": f"https://x.com/{username}/status/{t.get('id')}",
+            })
+        return results
+    except Exception as e:
+        soft_fail("Twitter v2 API request failed.", f"EXC: {e}")
+        return []
+
 def get_sentiment_analyzer():
     if not HAS_VADER:
         return None
@@ -1383,7 +1445,8 @@ with st.sidebar:
         with col_t3:
             tw_max = st.number_input("Max tweets", min_value=10, max_value=1000, value=300, step=50, key="tw_max")
 
-        st.caption("Tip: For Grok, set XAI_API_KEY. For VADER, NLTK is used locally (no key needed).")
+        # --- MODIFIED: Updated caption ---
+        st.caption("Tip: 'Grok' uses XAI_API_KEY. 'VADER' uses TWITTER_BEARER_TOKEN for fetching.")
 
         st.markdown("---")
 
@@ -1812,24 +1875,45 @@ if run_btn:
             # ---------- Social Sentiment pass (optional) ----------
             if current_params["enable_social"]:
                 spinner_msg = "Collecting and analyzing Twitter/X sentiment..."
+                
+                # --- MODIFIED: Main logic switch for fetching and analysis ---
+                tweets = []
+                df_t = pd.DataFrame()
+                
                 if current_params["sentiment_method"] == "Grok (xAI API)":
                     spinner_msg = "Collecting and analyzing Twitter/X sentiment via Grok..."
-
-                with st.spinner(spinner_msg):
-                    q = current_params["tw_query"]
-                    lang = current_params["tw_lang"]
-                    hours = current_params["tw_hours"]
-                    max_t = current_params["tw_max"]
-
-                    tweets = fetch_tweets_via_grok(q, lang, hours, max_t)
-                    if current_params["sentiment_method"] == "Grok (xAI API)":
+                    with st.spinner(spinner_msg):
+                        q = current_params["tw_query"]
+                        lang = current_params["tw_lang"]
+                        hours = current_params["tw_hours"]
+                        max_t = current_params["tw_max"]
+                        tweets = fetch_tweets_via_grok(q, lang, hours, max_t)
                         df_t = analyze_tweet_sentiment_grok(tweets)
-                    else: # VADER (Local)
-                        df_t = analyze_tweet_sentiment(tweets)
 
-                    summ = summarize_sentiment(df_t)
-                    st.session_state["sent_df"] = df_t
-                    st.session_state["sent_summary"] = summ
+                else: # VADER (Local)
+                    spinner_msg = "Collecting tweets via Twitter v2 API..."
+                    with st.spinner(spinner_msg):
+                        bearer = get_twitter_bearer()
+                        if not bearer:
+                            soft_fail("TWITTER_BEARER_TOKEN missing for VADER fetch.", "Skipping Twitter v2 fetch.")
+                        else:
+                            q = current_params["tw_query"]
+                            lang = current_params["tw_lang"]
+                            hours = current_params["tw_hours"]
+                            max_t = current_params["tw_max"]
+                            start_iso = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)).isoformat(timespec="seconds") + "Z"
+                            
+                            tweets = fetch_tweets_via_twitter_v2(bearer, q, lang, start_iso, max_t)
+                    
+                    if tweets:
+                        with st.spinner("Analyzing tweets with VADER..."):
+                            df_t = analyze_tweet_sentiment(tweets)
+                # --- END MODIFIED ---
+
+                summ = summarize_sentiment(df_t)
+                st.session_state["sent_df"] = df_t
+                st.session_state["sent_summary"] = summ
+            
             else:
                 st.session_state["sent_df"] = pd.DataFrame()
                 st.session_state["sent_summary"] = {"n": 0, "mean_compound": 0.0, "share_pos": 0.0, "share_neu": 0.0, "share_neg": 0.0}
